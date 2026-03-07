@@ -169,5 +169,5 @@ def main() -> None:
 
     agent_loop()
 
-    if __name__ == "__main__":
-        main()
+if __name__ == "__main__":
+    main()

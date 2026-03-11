@@ -6,6 +6,9 @@ from typing import Any
 from dotenv import load_dotenv
 import dashscope
 import json
+import uuid
+from datetime import datetime,timezone
+import time
 
 # ---------------------------------------------------------------------------
 # API配置
@@ -21,13 +24,15 @@ dashscope.base_http_api_url = BASE_URL
 
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant with access to tools.\n"
-    "Use the tools to help the user with file operations and shell commands.\n"
-    "Always read a file before editing it.\n"
-    "When using edit_file, the old_string must match EXACTLY (including whitespace)."
+    "Use tools to help the user with file and time queries.\n"
+    "Be concise. If a session has prior context, use it."
 )
 
 # 输出字符限制
 MAX_TOOL_OUTPUT = 50000
+
+# 上下文限制
+CONTEXT_SAFE_LIMIT = 180000
 
 # 工作目录 -- 限制Agent权限
 WORKDIR = Path.cwd()
@@ -43,6 +48,7 @@ RED = "\033[31m"
 DIM = "\033[2m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
+MAGENTA = "\033[35m"
 
 # 终端输入提示
 def colored_prompt() -> str:
@@ -60,6 +66,14 @@ def print_tool(name: str, detail: str) -> None:
 def print_info(text: str) -> None:
     print(f"{DIM}{text}{RESET}")
 
+# 输出警告信息
+def print_warn(text: str) -> None:
+    print(f"{YELLOW}{text}{RESET}")
+
+# 输出会话信息
+def print_session(text: str) -> None:
+    print(f"{MAGENTA}{text}{RESET}")
+
 # ---------------------------------------------------------------------------
 # 安全辅助函数
 # ---------------------------------------------------------------------------
@@ -72,6 +86,312 @@ def safe_path(raw: str) -> Path:
     except ValueError:
         raise ValueError(f"Path traversal blocker: {raw} resolves outside WORKDIR")
     return target
+
+# ---------------------------------------------------------------------------
+# 会话存储 -- 基于 JSONL
+# ---------------------------------------------------------------------------
+
+class SessionStore:
+    def __init__(self, agent_id: str = "default"):
+        self.agent_id = agent_id
+        self.base_dir = WORKDIR / ".sessions" / "agents" / agent_id / "sessions"
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.index_path = self.base_dir / "session.json"
+        self._index: dict[str, dict] = self._load_index()
+        self.current_session_id: str | None = None
+
+    def _load_index(self) -> dict[str, dict]:
+        if self.index_path.exists():
+            try:
+                return json.loads(self.index_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return {}
+        return {}
+
+    def _save_index(self) -> None:
+        self.index_path.write_text(
+            json.dumps(self._index, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _session_path(self, session_id: str) -> Path:
+        return self.base_dir / f"{session_id}.jsonl"
+
+    def create_session(self, label: str = "") -> str:
+        session_id = uuid.uuid4().hex[:12]
+        now = datetime.now(timezone.utc).isoformat()
+        self._index[session_id] = {
+            "label": label,
+            "created_at": now,
+            "last_active": now,
+            "message_count": 0,
+        }
+        self._save_index()
+        self._session_path(session_id).touch()
+        self.current_session_id = session_id
+        return session_id
+
+    # 加载会话记录
+    def load_session(self, session_id: str) -> list[dict]:
+        path = self._session_path(session_id)
+        if not path.exists():
+            return []
+        self.current_session_id = session_id
+        return self._rebuild_history(path)
+
+    def save_turn(self, role: str, content: Any) -> None:
+        if not self.current_session_id:
+            return
+        self.append_transcript(self.current_session_id, {
+            "role": role,
+            "content": content,
+            "ts": time.time(),
+        })
+
+    def append_transcript(self, session_id: str, record: dict) -> None:
+        path = self._session_path(session_id)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if session_id in self._index:
+            self._index[session_id]["last_active"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+            self._index[session_id]["message_count"] += 1
+            self._save_index()
+
+    # 根据 JSONL 重建 messages
+    @staticmethod
+    def _rebuild_history(path: Path) -> list[dict]:
+        messages: list[dict] = []
+
+        if not path.exists():
+            return messages
+
+        lines = path.read_text(encoding="utf-8").strip().split("\n")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "role" in msg:
+                messages.append(msg)
+        return messages
+
+    def list_sessions(self) -> list[tuple[str, dict]]:
+        items = list(self._index.items())
+        items.sort(key=lambda x: x[1].get("last_active", ""), reverse=True)
+        return items
+
+# 精简消息格式 - LLM 生成摘要
+def _serialize_messages_for_summary(messages: list[dict]) -> str:
+    parts = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            parts.append(f"[{role}]: {content}")
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(f"[{role}]: {block.get('text', '')}")
+    return "\n".join(parts)
+
+# ---------------------------------------------------------------------------
+# 处理会话消息-防止上下文溢出
+# ---------------------------------------------------------------------------
+
+class ContextGuard:
+    def __init__(self, max_tokens: int = CONTEXT_SAFE_LIMIT):
+        self.max_tokens = max_tokens
+
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        return len(text) // 4
+
+    # 估算消息的Token消耗
+    def estimate_messages_tokens(self, messages: list[dict]) -> int:
+        total = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total += self.estimate_tokens(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if "text" in block:
+                            total += self.estimate_tokens(block["text"])
+                        elif block.get("type") == "tool_result":
+                            rc = block.get("content", "")
+                            if isinstance(rc, str):
+                                total += self.estimate_tokens(rc)
+                        elif block.get("type") == "tool_use":
+                            total += self.estimate_tokens(
+                                json.dumps(block.get("input", {}))
+                            )
+                    else:
+                        if hasattr(block, "text"):
+                            total += self.estimate_tokens(block.text)
+                        elif hasattr(block, "input"):
+                            total += self.estimate_tokens(
+                                json.dumps(block.input)
+                            )
+        return total
+
+    # 截断文本 - 并尽量保持可读性
+    def truncate_tool_result(self, result: str, max_fraction: float = 0.3) -> str:
+        max_chars = int(self.max_tokens * 4 * max_fraction)
+        if len(result) <= max_chars:
+            return result
+        cut = result.rfind("\n", 0, max_chars)
+        if cut <= 0:
+            cut = max_chars
+        head = result[:cut]
+        return head + f"\n\n[... truncated ({len(result)} chars total, showing first {len(head)}) ...]"
+
+    # 总结历史消息 - 形成摘要
+    @staticmethod
+    def compact_history(messages: list[dict]) -> list[dict]:
+        total = len(messages)
+        if total <= 4:
+            return messages
+
+        keep_count = max(4, int(total * 0.2))
+        compress_count = max(2, int(total * 0.5))
+        compress_count = min(compress_count, total - keep_count)
+
+        if compress_count < 2:
+            return messages
+
+        old_messages = messages[:compress_count]
+        recent_messages = messages[compress_count:]
+
+        old_text = _serialize_messages_for_summary(old_messages)
+
+        summary_prompt = (
+            "Summarize the following conversation concisely, "
+            "preserving key facts and decisions. "
+            "Output only the summary, no preamble.\n\n"
+            f"{old_text}"
+        )
+
+        try:
+            response = dashscope.MultiModalConversation.call(
+                api_key=API_KEY,
+                model=MODEL_ID,
+                messages=[
+                    {"role": "system", "content": "You are a conversation summarizer. Be concise and factual."},
+                    {"role": "user", "content": summary_prompt}
+                ],
+                max_tokens=2048,
+                result_format='message'
+            )
+            if response.status_code != 200:
+                raise Exception(f"API Error {response.status_code}: {response.message}")
+
+            content = response.output.content[0].content
+            if isinstance(content, list):
+                summary_text = "\n".join(item["text"] for item in content if isinstance(item, dict) and "text" in item)
+            else:
+                summary_text = str(content)
+
+            print_session(
+                f" [compact] {len(old_messages)} messages -> summary "
+                f"({len(summary_text)} chars)"
+            )
+        except Exception as exc:
+            print_warn(f" [compact] Summary failed ({exc}), dropping old messages")
+            return recent_messages
+
+        compacted = [
+            {
+                "role": "user",
+                "content": "[Previous conversation summary]\n" + summary_text,
+            },
+            {
+                "role": "assistant",
+                "content": "Understood, I have the context from our previous conversation."  # 直接使用字符串
+            },
+        ]
+
+        compacted.extend(recent_messages)
+        return compacted
+
+    # 遍历消息列表 - 截断过长的工具调用结果
+    def _truncate_large_tool_results(self, messages: list[dict]) -> list[dict]:
+        result = []
+        for msg in messages:
+            if msg.get("role") == "tool":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    new_msg = msg.copy()
+                    new_msg["content"] = self.truncate_tool_result(content)
+                    result.append(new_msg)
+                else:
+                    result.append(msg)
+            else:
+                result.append(msg)
+        return result
+
+    def guard_api_call(
+            self,
+            api_key: str,
+            model: str,
+            system: str,
+            messages: list[dict],
+            max_tokens: int = 8096,
+            tools: list[dict] | None = None,
+            max_retries: int = 2,
+    ) -> Any:
+        current_messages = messages
+
+        for attempt in range(max_retries + 1):
+            try:
+                full_messages = [{"role": "system", "content": system}] + current_messages
+
+                kwargs = {
+                    "api_key": api_key,
+                    "model": model,
+                    "max_tokens": 8096,
+                    "messages": full_messages,
+                    "result_format": "message",
+                }
+                if tools:
+                    kwargs["tools"] = tools
+
+                response = dashscope.MultiModalConversation.call(**kwargs)
+
+                if response.status_code != 200:
+                    raise Exception(f"API Error {response.status_code}: {response.message}")
+
+                if current_messages is not messages:
+                    messages.clear()
+                    messages.extend(current_messages)
+                return response
+
+            except Exception as exc:
+                error_str = str(exc).lower()
+                is_overflow = "context" in error_str or "token" in error_str
+
+                if not is_overflow or attempt >= max_retries:
+                    raise
+
+                if attempt == 0:
+                    print_warn(
+                        "  [guard] Context overflow detected, "
+                        "truncating large tool results..."
+                    )
+                    current_messages = self._truncate_large_tool_results(current_messages)
+                elif attempt == 1:
+                    print_warn(
+                        "  [guard] Still overflowing, "
+                        "compacting conversation history..."
+                    )
+                    current_messages = self.compact_history(current_messages)
+
+        raise RuntimeError("guard_api_call: exhausted retries")
 
 # 截断过长文本
 def truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
@@ -169,6 +489,31 @@ def tool_edit_file(file_path: str, old_string: str, new_string: str) -> str:
         return str(exc)
     except Exception as exc:
         return f"Error: {exc}"
+
+# 列出目录内容工具
+def tool_list_directory(directory: str = ".") -> str:
+    print_tool("list_directory", directory)
+    try:
+        target = safe_path(directory)
+        if not target.exists():
+            return f"Error: Directory not found: {directory}"
+        if not target.is_dir():
+            return f"Error: Not a directory: {directory}"
+        entries = sorted(target.iterdir())
+        lines = []
+        for entry in entries:
+            prefix = "[dir]  " if entry.is_dir() else "[file] "
+            lines.append(prefix + entry.name)
+        return "\n".join(lines) if lines else "[empty directory]"
+    except ValueError as exc:
+        return str(exc)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+def tool_get_current_time() -> str:
+    print_tool("get_current_time", "")
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 # ---------------------------------------------------------------------------
 # 工具定义 - Schema + Handler
@@ -268,6 +613,35 @@ TOOLS = [
                 "required": ["file_path", "old_string", "new_string"],
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and subdirectories in a directory under workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory": {
+                        "type": "string",
+                        "description": "Path relative to workspace directory. Default is root.",
+                    },
+                },
+                "required": [],
+            },
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current date and time in UTC.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        }
     }
 ]
 
@@ -277,6 +651,8 @@ TOOL_HANDLERS: dict[str, Any] = {
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
+    "list_directory": tool_list_directory,
+    "get_current_time": tool_get_current_time,
 }
 
 # ---------------------------------------------------------------------------
@@ -295,17 +671,146 @@ def process_tool_call(tool_name: str, tool_input: dict[str, Any]) -> str:
         return f"Error: {tool_name} failed: {exc}"
 
 # ---------------------------------------------------------------------------
+# Read-Eval-Print Loop
+# ---------------------------------------------------------------------------
+
+def handle_repl_command(
+        command: str,
+        store: SessionStore,
+        guard: ContextGuard,
+        messages: list[dict]
+) -> tuple[bool, list[dict]]:
+    parts = command.strip().split(maxsplit = 1)
+    cmd = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if cmd == "/new":
+        label = arg or ""
+        sid = store.create_session(label)
+        print_session(f"  Created new session: {sid}" + (f" ({label})" if label else ""))
+        return True,[]
+    elif cmd == "/list":
+        sessions = store.list_sessions()
+        if not sessions:
+            print_info("No sessions found.")
+            return True, messages
+
+        print_info("Sessions:")
+        for sid, meta in sessions:
+            active = "<-- current" if sid == store.current_session_id else ""
+            label = meta.get("label", "")
+            label_str = f" {label}" if label else ""
+            count = meta.get("message_count", 0)
+            last = meta.get("last_active", "?")[:19]
+            print_info(
+                f" {sid}{label_str} "
+                f"msgs={count} last={last}{active}"
+            )
+        return True, messages
+
+    elif cmd == "/switch":
+        if not arg:
+            print_warn("Usage: /switch <session_id>")
+            return True,messages
+        query = arg.strip()
+
+        # 会话ID匹配
+        matched = [
+            sid for sid in store._index if sid.startswith(query)
+        ]
+
+        # 会话名称匹配
+        if not matched:
+            matched = [
+                sid for sid, meta in store._index.items()
+                if meta.get("label").startswith(query)
+            ]
+
+        if len(matched) == 0:
+            print_warn(f" Session not found: {query}")
+            return True, messages
+        if len(matched) > 1:
+            print_warn(f" Ambiguous prefix, matches: {', '.join(matched)}")
+            return True, messages
+
+        new_sid = matched[0]
+        new_messages = store.load_session(new_sid)
+        print_session(f" Switched to session: {new_sid} ({len(new_messages)} messages)")
+        return True, new_messages
+
+    elif cmd == "/context":
+        estimated = guard.estimate_messages_tokens(messages)
+        pct = (estimated / guard.max_tokens) * 100
+        bar_len = 30
+        filled = int(bar_len * min(pct, 100) / 100)
+        bar = "#" * filled + "-" * (bar_len - filled)
+        color = GREEN if pct < 50 else (YELLOW if pct < 80 else RED)
+        print_info(f"  Context usage: ~{estimated:,} / {guard.max_tokens:,} tokens")
+        print(f"  {color}[{bar}] {pct:.1f}%{RESET}")
+        print_info(f"  Messages: {len(messages)}")
+        return True, messages
+
+    elif cmd == "/compact":
+        if len(messages) <= 4:
+            print_info("  Too few messages to compact (need > 4).")
+            return True, messages
+        print_session("  Compacting history...")
+        new_messages = guard.compact_history(messages)
+        print_session(f"  {len(messages)} -> {len(new_messages)} messages")
+        return True, new_messages
+
+    elif cmd == "/help":
+        print_info("  Commands:")
+        print_info("    /new [label]       Create a new session")
+        print_info("    /list              List all sessions")
+        print_info("    /switch <id>       Switch to a session (prefix match)")
+        print_info("    /context           Show context token usage")
+        print_info("    /compact           Manually compact conversation history")
+        print_info("    /help              Show this help")
+        print_info("    quit / exit        Exit the REPL")
+        return True, messages
+
+    return False, messages
+
+# ---------------------------------------------------------------------------
+# 辅助函数 - 格式处理
+# ---------------------------------------------------------------------------
+
+# 从模型的返回值中提取文本
+def extract_assistant_text(message: dict) -> str:
+    content = message.get("content", "")
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if isinstance(item, dict) and "text" in item:
+                texts.append(item["text"])
+        return "\n".join(texts)
+    return str(content)
+
+# ---------------------------------------------------------------------------
 # 核心: Agent 循环
 # ---------------------------------------------------------------------------
 
 def agent_loop() -> None:
-    messages: list[dict] = []
+    store = SessionStore(agent_id="MyClaw")
+    guard = ContextGuard()
+
+    sessions = store.list_sessions()
+    if sessions:
+        sid = sessions[0][0]
+        messages = store.load_session(sid)
+        print_session(f" Resumed session: {sid} ({len(messages)} messages)")
+    else:
+        sid = store.create_session("initial")
+        messages = []
+        print_session(f" Created initial session: {sid}")
 
     print_info("=" * 60)
     print_info(f"  Model: {MODEL_ID}")
+    print_info(f"  Session: {store.current_session_id}")
     print_info(f"  Workdir: {WORKDIR}")
     print_info(f"  Tools: {', '.join(TOOL_HANDLERS.keys())}")
-    print_info("  输入 'quit' 或 'exit' 退出. Ctrl+C 同样有效.")
+    print_info("  输入 /help 获取指令提示, 输入 'quit' 或 'exit' 退出. Ctrl+C 同样有效.")
     print_info("=" * 60)
     print()
 
@@ -323,16 +828,25 @@ def agent_loop() -> None:
             print(f"{DIM}再见.{RESET}")
             break
 
+        # --- REPL 命令 ---
+        if user_input.startswith("/"):
+            handled, messages = handle_repl_command(
+                user_input, store, guard, messages
+            )
+            if handled:
+                continue
+
         # --- 添加聊天记录到历史 ---
         messages.append({
             "role" : "user",
             "content" : user_input,
         })
+        store.save_turn("user", user_input)
 
         # --- Agent 工具使用循环 ---
         while True:
             try:
-                response = dashscope.MultiModalConversation.call(
+                response = guard.guard_api_call(
                     api_key = API_KEY,
                     model = MODEL_ID,
                     max_tokens = 8096,
@@ -358,23 +872,26 @@ def agent_loop() -> None:
 
             choice = response.output.choices[0]
             finish_reason = choice.finish_reason
+            assistant_message = choice.message
+
+            messages.append({
+                "role": "assistant",
+                "content": assistant_message,
+            })
+            store.save_turn("assistant", assistant_message)
 
             # --- 调用终止条件stop_reason ---
             if finish_reason == "stop":
-                assistant_text = choice.message.get("content", "")
-                if assistant_text:
-                    print_assistant(assistant_text)
-                messages.append({"role": "assistant", "content": assistant_text})
-                break
+               text = extract_assistant_text(assistant_message)
+               if text:
+                   print_assistant(text)
+               break
 
             elif finish_reason == "tool_calls":
-                assistant_text = choice.message
-                tool_calls = assistant_text.get("tool_calls", [])
-
-                messages.append(assistant_text) # 添加Assistant的原始消息到历史消息
+                tool_calls = assistant_message.get("tool_calls", [])
 
                 for tool_call in tool_calls:
-                    print(f"\n{tool_call}\n") # 测试代码
+                    # print(f"\n{tool_call}\n") # 测试代码
                     function = tool_call["function"]
                     tool_name = function["name"]
                     tool_args = json.loads(function.get("arguments", "{}")) # arguments 是 JSON 格式
@@ -388,15 +905,15 @@ def agent_loop() -> None:
                         "tool_call_id": tool_call_id,
                     }
                     messages.append(tool_message)
+                    store.save_turn("tool", tool_message)
 
                 continue
 
             else:
                 print_info(f"[finish_reason]={finish_reason}")
-                assistant_text = choice.message.get("content", "")
-                if assistant_text:
-                    print_assistant(assistant_text)
-                    messages.append({"role": "assistant", "content": assistant_text})
+                text = extract_assistant_text(assistant_message)
+                if text:
+                    print_assistant(text)
                 break
 
 # ---------------------------------------------------------------------------

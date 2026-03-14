@@ -8,7 +8,6 @@ import dashscope
 import json
 import uuid
 from datetime import datetime,timezone
-import time
 
 # ---------------------------------------------------------------------------
 # API配置
@@ -138,15 +137,6 @@ class SessionStore:
             return []
         self.current_session_id = session_id
         return self._rebuild_history(path)
-
-    def save_turn(self, role: str, content: Any) -> None:
-        if not self.current_session_id:
-            return
-        self.append_transcript(self.current_session_id, {
-            "role": role,
-            "content": content,
-            "ts": time.time(),
-        })
 
     def append_transcript(self, session_id: str, record: dict) -> None:
         path = self._session_path(session_id)
@@ -837,11 +827,14 @@ def agent_loop() -> None:
                 continue
 
         # --- 添加聊天记录到历史 ---
-        messages.append({
-            "role" : "user",
-            "content" : user_input,
-        })
-        store.save_turn("user", user_input)
+        user_message = {
+            "role": "user",
+            "content": user_input,
+        }
+        messages.append(user_message)
+
+        user_record = user_message.copy()
+        store.append_transcript(store.current_session_id, user_record)
 
         # --- Agent 工具使用循环 ---
         while True:
@@ -874,11 +867,17 @@ def agent_loop() -> None:
             finish_reason = choice.finish_reason
             assistant_message = choice.message
 
-            messages.append({
+            assistant_dict = {
                 "role": "assistant",
-                "content": assistant_message,
-            })
-            store.save_turn("assistant", assistant_message)
+                "content": assistant_message.content if hasattr(assistant_message, "content") else None
+            }
+            tool_calls = assistant_message.get("tool_calls" if isinstance(assistant_message, dict) else None)
+            if tool_calls:
+                assistant_dict["tool_calls"] = assistant_message.tool_calls
+            messages.append(assistant_dict)
+
+            assistant_record = assistant_dict.copy()
+            store.append_transcript(store.current_session_id, assistant_record)
 
             # --- 调用终止条件stop_reason ---
             if finish_reason == "stop":
@@ -905,7 +904,9 @@ def agent_loop() -> None:
                         "tool_call_id": tool_call_id,
                     }
                     messages.append(tool_message)
-                    store.save_turn("tool", tool_message)
+
+                    tool_record = tool_message.copy()
+                    store.append_transcript(store.current_session_id, tool_record)
 
                 continue
 

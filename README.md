@@ -11,7 +11,7 @@ Tool Use(with workpath check) ✔
 
 Sessions Store ✔
 
-
+Multichannel ✔
 
 
 

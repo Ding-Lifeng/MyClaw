@@ -1,13 +1,17 @@
-import os
-import sys
+import os, sys, subprocess, json, uuid, time, queue, threading
 from pathlib import Path
-import subprocess
 from typing import Any
 from dotenv import load_dotenv
 import dashscope
-import json
-import uuid
 from datetime import datetime,timezone
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
 
 # ---------------------------------------------------------------------------
 # API配置
@@ -23,6 +27,7 @@ dashscope.base_http_api_url = BASE_URL
 
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant with access to tools.\n"
+    "You can also connect to multiple messaging channels.\n"
     "Use tools to help the user with file and time queries.\n"
     "Be concise. If a session has prior context, use it."
 )
@@ -36,6 +41,10 @@ CONTEXT_SAFE_LIMIT = 180000
 # 工作目录 -- 限制Agent权限
 WORKDIR = Path.cwd()
 
+# 状态目录 -- 存储Agent运行过程文件
+STATE_DIR = WORKDIR / ".state"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
 # ---------------------------------------------------------------------------
 # ANSI 颜色配置-丰富终端显示效果
 # ---------------------------------------------------------------------------
@@ -48,6 +57,7 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 MAGENTA = "\033[35m"
+BLUE = "\033[34m"
 
 # 终端输入提示
 def colored_prompt() -> str:
@@ -59,7 +69,7 @@ def print_assistant(text: str) -> None:
 
 # 工具调用信息
 def print_tool(name: str, detail: str) -> None:
-    print(f"  {DIM}[tool: {name}] {detail}{RESET}")
+    print(f"{DIM}[tool: {name}] {detail}{RESET}")
 
 # 输出提示信息
 def print_info(text: str) -> None:
@@ -72,6 +82,253 @@ def print_warn(text: str) -> None:
 # 输出会话信息
 def print_session(text: str) -> None:
     print(f"{MAGENTA}{text}{RESET}")
+
+# 输出通道信息
+def print_channel(text: str) -> None:
+    print(f"{BLUE}{text}{RESET}")
+
+# ---------------------------------------------------------------------------
+# 数据结构
+# ---------------------------------------------------------------------------
+
+# 统一输入数据结构
+@dataclass
+class InboundMessage:
+    text: str
+    sender_id: str
+    channel: str = ""
+    account_id: str = ""
+    peer_id: str = ""
+    is_group: bool = False
+    media: list = field(default_factory=list)
+    raw: dict = field(default_factory=dict)
+
+# 通道帐号设置
+@dataclass
+class ChannelAccount:
+    channel: str
+    account_id: str
+    token: str = ""
+    config: dict = field(default_factory=dict)
+
+# ---------------------------------------------------------------------------
+# 实时会话存储
+# ---------------------------------------------------------------------------
+
+def build_session_key(channel: str, account_id: str, peer_id: str) -> str:
+    return f"agent:main:direct:{channel}:{peer_id}"
+
+# ---------------------------------------------------------------------------
+# Channel 类
+# ---------------------------------------------------------------------------
+
+# 抽象基类
+class Channel(ABC):
+    name: str = "unknown"
+
+    @abstractmethod
+    def receive(self) -> InboundMessage | None: ...
+
+    @abstractmethod
+    def send(self, to: str, text: str, **kwargs: Any) -> bool: ...
+
+    def close(self) -> None:
+        pass
+
+# CLI Channel
+class CLIChannel(Channel):
+    name = "cli"
+
+    def __init__(self) -> None:
+        self.account_id = "cli-local"
+        self._input_allowed = threading.Event()
+        self._input_allowed.set()
+
+    def allow_input(self) -> None:
+        self._input_allowed.set()
+
+    def receive(self) -> InboundMessage | None:
+        self._input_allowed.wait()
+        self._input_allowed.clear()
+        try:
+            text = input(colored_prompt()).strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if not text:
+            self._input_allowed.set()
+            return None
+        return InboundMessage(
+            text=text, sender_id="cli-user", channel="cli",
+            account_id=self.account_id, peer_id="cli-user",
+        )
+
+    def send(self, to: str, text: str, **kwargs: Any) -> bool:
+        print_assistant(text)
+        return True
+
+# FeishuChannel - 基于 webhook
+class FeishuChannel(Channel):
+    name = "feishu"
+
+    def __init__(self, account: ChannelAccount) -> None:
+        if not HAS_HTTPX:
+            raise RuntimeError("FeishuChannel requires httpx: pip install httpx")
+        self.account_id = account.account_id
+        self.app_id = account.config.get("app_id", "")
+        self.app_secret = account.config.get("app_secret", "")
+        self._encrypt_key = account.config.get("encrypt_key", "")
+        self._bot_open_id = account.config.get("bot_open_id", "")
+        is_lark = account.config.get("is_lark", False)
+        self.api_base = ("https://open.larksuite.com/open-apis" if is_lark
+                         else "https://open.feishu.cn/open-apis")
+        self._tenant_token: str = ""
+        self._token_expires_at: float = 0.0
+        self._http = httpx.Client(timeout=15.0)
+
+    def _refresh_token(self) -> str:
+        if self._tenant_token and time.time() < self._token_expires_at:
+            return self._tenant_token
+        try:
+            resp = self._http.post(
+                f"{self.api_base}/auth/v3/tenant_access_token/internal",
+                json={"app_id": self.app_id, "app_secret": self.app_secret},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                print(f"{RED}[feishu] Token error: {data.get('msg', '?')}{RESET}")
+                return ""
+            self._tenant_token = data.get("tenant_access_token", "")
+            self._token_expires_at = time.time() + data.get("expire", 7200) - 300
+            return self._tenant_token
+        except Exception as exc:
+            print(f"{RED}[feishu] Token error: {exc}{RESET}")
+            return ""
+
+    def _bot_mentioned(self, event: dict) -> bool:
+        for m in event.get("message", {}).get("mentions", []):
+            mid = m.get("id", {})
+            if isinstance(mid, dict) and mid.get("open_id") == self._bot_open_id:
+                return True
+            if isinstance(mid, str) and mid == self._bot_open_id:
+                return True
+            if m.get("key") == self._bot_open_id:
+                return True
+        return False
+
+    def _parse_content(self, message: dict) -> tuple[str, list]:
+        msg_type = message.get("msg_type", "text")
+        raw = message.get("content", "{}")
+        try:
+            content = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            return "", []
+
+        media: list[dict] = []
+        if msg_type == "text":
+            return content.get("text", ""), media
+        if msg_type == "post":
+            texts: list[str] = []
+            for lc in content.values():
+                if not isinstance(lc, dict):
+                    continue
+                title = lc.get("title", "")
+                if title:
+                    texts.append(title)
+                for para in lc.get("content", []):
+                    for node in para:
+                        tag = node.get("tag")
+                        if tag == "text":
+                            texts.append(node.get("text", ""))
+                        elif tag == "a":
+                            texts.append(node.get("text", "") + " " + node.get("href", ""))
+            return "\n".join(texts), media
+        if msg_type == "image":
+            key = content.get("image_key", "")
+            if key:
+                media.append({"type": "image", "key": key})
+            return "[image]", media
+        return "", media
+
+    def parse_event(self, payload: dict, token: str = "") -> InboundMessage | None:
+        """解析飞书事件回调。使用简单的 token 校验进行验证。"""
+        if self._encrypt_key and token and token != self._encrypt_key:
+            print(f"{RED}[feishu] Token verification failed{RESET}")
+            return None
+        if "challenge" in payload:
+            print_info(f"[feishu] Challenge: {payload['challenge']}")
+            return None
+
+        event = payload.get("event", {})
+        message = event.get("message", {})
+        sender = event.get("sender", {}).get("sender_id", {})
+        user_id = sender.get("open_id", sender.get("user_id", ""))
+        chat_id = message.get("chat_id", "")
+        chat_type = message.get("chat_type", "")
+        is_group = chat_type == "group"
+
+        if is_group and self._bot_open_id and not self._bot_mentioned(event):
+            return None
+
+        text, media = self._parse_content(message)
+        if not text:
+            return None
+
+        return InboundMessage(
+            text=text, sender_id=user_id, channel="feishu",
+            account_id=self.account_id,
+            peer_id=user_id if chat_type == "p2p" else chat_id,
+            media=media, is_group=is_group, raw=payload,
+        )
+
+    def receive(self) -> InboundMessage | None:
+        return None
+
+    def send(self, to: str, text: str, **kwargs: Any) -> bool:
+        token = self._refresh_token()
+        if not token:
+            return False
+        try:
+            resp = self._http.post(
+                f"{self.api_base}/im/v1/messages",
+                params={"receive_id_type": "chat_id"},
+                headers={"Authorization": f"Bearer {token}"},
+                json={"receive_id": to, "msg_type": "text",
+                      "content": json.dumps({"text": text})},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                print(f"{RED}[feishu] Send: {data.get('msg', '?')}{RESET}")
+                return False
+            return True
+        except Exception as exc:
+            print(f"{RED}[feishu] Send: {exc}{RESET}")
+            return False
+
+    def close(self) -> None:
+        self._http.close()
+
+# ---------------------------------------------------------------------------
+# Channel 管理
+# ---------------------------------------------------------------------------
+
+class ChannelManager:
+    def __init__(self) -> None:
+        self.channels: dict[str, Channel] = {}
+        self.accounts: list[ChannelAccount] = []
+
+    def register(self, channel: Channel) -> None:
+        self.channels[channel.name] = channel
+        print_channel(f"[+] Channel registered: {channel.name}")
+
+    def list_channels(self) -> list[str]:
+        return list(self.channels.keys())
+
+    def get(self, name: str) -> Channel | None:
+        return self.channels.get(name)
+
+    def close_all(self) -> None:
+        for ch in self.channels.values():
+            ch.close()
 
 # ---------------------------------------------------------------------------
 # 安全辅助函数
@@ -383,7 +640,7 @@ class ContextGuard:
 
         raise RuntimeError("guard_api_call: exhausted retries")
 
-# 截断过长文本
+# 截断过长文本 TODO:统一truncate工具
 def truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     if len(text) <= limit:
         return text
@@ -392,6 +649,7 @@ def truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
 # ---------------------------------------------------------------------------
 # 工具实现
 # ---------------------------------------------------------------------------
+MEMORY_FILE = WORKDIR / "MEMORY.md"
 
 # shell 命令工具
 def tool_bash(command: str, timeout: int = 30) -> str:
@@ -500,10 +758,34 @@ def tool_list_directory(directory: str = ".") -> str:
     except Exception as exc:
         return f"Error: {exc}"
 
+# 获取时间工具
 def tool_get_current_time() -> str:
     print_tool("get_current_time", "")
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+# 记忆书写工具
+def tool_memory_write(content: str) -> str:
+    print_tool("memory_write", f"{len(content)} chars")
+    try:
+        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(MEMORY_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n- {content}\n")
+        return f"Written to memory: {content[:80]}..."
+    except Exception as exc:
+        return f"Error: {exc}"
+
+# 记忆搜索工具
+def tool_memory_search(query: str) -> str:
+    print_tool("memory_search", query)
+    if not MEMORY_FILE.exists():
+        return "Memory file is empty."
+    try:
+        lines = MEMORY_FILE.read_text(encoding="utf-8").splitlines()
+        matches = [l for l in lines if query.lower() in l.lower()]
+        return "\n".join(matches[:20]) if matches else f"No matches for '{query}'."
+    except Exception as exc:
+        return f"Error: {exc}"
 
 # ---------------------------------------------------------------------------
 # 工具定义 - Schema + Handler
@@ -632,6 +914,40 @@ TOOLS = [
                 "required": [],
             },
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_write",
+            "description": "Save a note to long-term memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The text to remember.",
+                    },
+                },
+                "required": ["content"],
+            },
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "Search through saved memory notes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search keyword.",
+                    },
+                },
+                "required": ["query"],
+            },
+        }
     }
 ]
 
@@ -643,6 +959,8 @@ TOOL_HANDLERS: dict[str, Any] = {
     "edit_file": tool_edit_file,
     "list_directory": tool_list_directory,
     "get_current_time": tool_get_current_time,
+    "memory_write": tool_memory_write,
+    "memory_search": tool_memory_search,
 }
 
 # ---------------------------------------------------------------------------
@@ -668,7 +986,8 @@ def handle_repl_command(
         command: str,
         store: SessionStore,
         guard: ContextGuard,
-        messages: list[dict]
+        messages: list[dict],
+        mgr: ChannelManager
 ) -> tuple[bool, list[dict]]:
     parts = command.strip().split(maxsplit = 1)
     cmd = parts[0].lower()
@@ -677,7 +996,7 @@ def handle_repl_command(
     if cmd == "/new":
         label = arg or ""
         sid = store.create_session(label)
-        print_session(f"  Created new session: {sid}" + (f" ({label})" if label else ""))
+        print_session(f"Created new session: {sid}" + (f" ({label})" if label else ""))
         return True,[]
     elif cmd == "/list":
         sessions = store.list_sessions()
@@ -717,10 +1036,10 @@ def handle_repl_command(
             ]
 
         if len(matched) == 0:
-            print_warn(f" Session not found: {query}")
+            print_warn(f"Session not found: {query}")
             return True, messages
         if len(matched) > 1:
-            print_warn(f" Ambiguous prefix, matches: {', '.join(matched)}")
+            print_warn(f"Ambiguous prefix, matches: {', '.join(matched)}")
             return True, messages
 
         new_sid = matched[0]
@@ -737,17 +1056,38 @@ def handle_repl_command(
         color = GREEN if pct < 50 else (YELLOW if pct < 80 else RED)
         print_info(f"  Context usage: ~{estimated:,} / {guard.max_tokens:,} tokens")
         print(f"  {color}[{bar}] {pct:.1f}%{RESET}")
-        print_info(f"  Messages: {len(messages)}")
+        print_info(f"Messages: {len(messages)}")
         return True, messages
 
     elif cmd == "/compact":
         if len(messages) <= 4:
-            print_info("  Too few messages to compact (need > 4).")
+            print_info("Too few messages to compact (need > 4).")
             return True, messages
-        print_session("  Compacting history...")
+        print_session("Compacting history...")
         new_messages = guard.compact_history(messages)
-        print_session(f"  {len(messages)} -> {len(new_messages)} messages")
+        print_session(f"{len(messages)} -> {len(new_messages)} messages")
         return True, new_messages
+
+    elif cmd == "/channels":
+        channels = mgr.list_channels()
+        if channels:
+            print_channel("Channels:")
+            for name in channels:
+                print_channel(f"  - {name}")
+        else:
+            print_info("No channels.")
+        return True, messages
+
+    elif cmd == "/accounts":
+        accounts = mgr.accounts
+        if accounts:
+            print_channel("Accounts:")
+            for acc in accounts:
+                masked = acc.token[:8] + "..." if len(acc.token) > 8 else "(none)"
+                print_channel(f"- {acc.channel}/{acc.account_id}  token={masked}")
+        else:
+            print_info("No accounts.")
+        return True, messages
 
     elif cmd == "/help":
         print_info("  Commands:")
@@ -756,6 +1096,8 @@ def handle_repl_command(
         print_info("    /switch <id>       Switch to a session (prefix match)")
         print_info("    /context           Show context token usage")
         print_info("    /compact           Manually compact conversation history")
+        print_info("    /channels          List all active channels")
+        print_info("    /accounts          List configured bot accounts")
         print_info("    /help              Show this help")
         print_info("    quit / exit        Exit the REPL")
         return True, messages
@@ -778,144 +1120,231 @@ def extract_assistant_text(message: dict) -> str:
     return str(content)
 
 # ---------------------------------------------------------------------------
+# Agent 交互回合
+# ---------------------------------------------------------------------------
+
+def run_agent_turn(
+        inbound: InboundMessage,
+        conversations: dict[str, list[dict]],
+        mgr: ChannelManager,
+        store: SessionStore | None = None,
+) -> None:
+    sk = build_session_key(inbound.channel, inbound.account_id, inbound.peer_id)
+    if sk not in conversations:
+        conversations[sk] = []
+    messages = conversations[sk]
+
+    should_presist = (store is not None and inbound.channel == "cli")
+
+    # --- 添加聊天记录到历史 ---
+    user_message = {
+        "role": "user",
+        "content": inbound.text,
+    }
+    messages.append(user_message)
+    if should_presist:
+        user_record = user_message.copy()
+        store.append_transcript(store.current_session_id, user_record)
+
+    guard = ContextGuard()
+
+    while True:
+        try:
+            response = guard.guard_api_call(
+                api_key=API_KEY,
+                model=MODEL_ID,
+                max_tokens=8096,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages,
+            )
+        except Exception as exc:
+            print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
+            while messages and messages[-1]["role"] != "user":
+                messages.pop()
+            if messages:
+                messages.pop()
+            break
+
+        if response.status_code != 200:
+            print_info(f"\nAPI Error {response.status_code}: {response.message}\n")
+            while messages and messages[-1]["role"] != "system":
+                messages.pop()
+            break
+
+        choice = response.output.choices[0]
+        finish_reason = choice.finish_reason
+        assistant_message = choice.message
+
+        assistant_dict = {
+            "role": "assistant",
+            "content": assistant_message.content if hasattr(assistant_message, "content") else None
+        }
+        tool_calls = assistant_message.get("tool_calls" if isinstance(assistant_message, dict) else None)
+        if tool_calls:
+            assistant_dict["tool_calls"] = assistant_message.tool_calls
+        messages.append(assistant_dict)
+        if should_presist:
+            assistant_record = assistant_dict.copy()
+            store.append_transcript(store.current_session_id, assistant_record)
+
+        # --- 调用终止条件stop_reason ---
+        if finish_reason == "stop":
+            text = extract_assistant_text(assistant_message)
+            if text:
+                ch = mgr.get(inbound.channel)
+                if ch:
+                    ch.send(inbound.peer_id, text)
+                else:
+                    print_assistant(text)
+            break
+
+        elif finish_reason == "tool_calls":
+            tool_calls = assistant_message.get("tool_calls", [])
+
+            for tool_call in tool_calls:
+                # print(f"\n{tool_call}\n") # 测试代码
+                function = tool_call["function"]
+                tool_name = function["name"]
+                tool_args = json.loads(function.get("arguments", "{}"))  # arguments 是 JSON 格式
+                tool_call_id = tool_call.get("id")
+
+                result = process_tool_call(tool_name, tool_args)  # 工具调用
+
+                tool_message = {
+                    "role": "tool",
+                    "content": result,
+                    "tool_call_id": tool_call_id,
+                }
+                messages.append(tool_message)
+                if should_presist:
+                    tool_record = tool_message.copy()
+                    store.append_transcript(store.current_session_id, tool_record)
+
+            continue
+
+        else:
+            print_info(f"[finish_reason]={finish_reason}")
+            text = extract_assistant_text(assistant_message)
+            if text:
+                ch = mgr.get(inbound.channel)
+                if ch:
+                    ch.send(inbound.peer_id, text)
+                else:
+                    print_assistant(text)
+            break
+
+# ---------------------------------------------------------------------------
 # 核心: Agent 循环
 # ---------------------------------------------------------------------------
 
 def agent_loop() -> None:
+    mgr = ChannelManager()  # 初始化通道管理
+
+    # 注册 CLI 通道
+    cli = CLIChannel()
+    mgr.register(cli)
+
+    # 注册飞书通道
+    fs_id = os.getenv("FEISHU_APP_ID", "").strip()
+    fs_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
+    if fs_id and fs_secret and HAS_HTTPX:
+        fs_acc = ChannelAccount(
+            channel="feishu",
+            account_id="feishu-primary",
+            config={
+                "app_id": fs_id,
+                "app_secret": fs_secret,
+                "encrypt_key": os.getenv("FEISHU_ENCRYPT_KEY", ""),
+                "bot_open_id": os.getenv("FEISHU_BOT_OPEN_ID", ""),
+                "is_lark": os.getenv("FEISHU_IS_LARK", "").lower() in ("1", "true"),
+            }
+        )
+        mgr.accounts.append(fs_acc)
+        mgr.register(FeishuChannel(fs_acc))
+        print_channel("[+] Feishu channel registered (requires webhook server)")
+
+    # CLI 持久化
     store = SessionStore(agent_id="MyClaw")
     guard = ContextGuard()
 
+    # 内存会话存储 - Channel实时对话
+    conversations: dict[str, list[dict]] = {}
+
+    cli_sk = build_session_key("cli", "cli-local", "cli-user")
     sessions = store.list_sessions()
     if sessions:
         sid = sessions[0][0]
-        messages = store.load_session(sid)
-        print_session(f" Resumed session: {sid} ({len(messages)} messages)")
+        cli_history = store.load_session(sid)
+        conversations[cli_sk] = cli_history
+        print_session(f"Resumed session: {sid} ({len(cli_history)} messages)")
     else:
         sid = store.create_session("initial")
-        messages = []
-        print_session(f" Created initial session: {sid}")
+        conversations[cli_sk] = []
+        print_session(f"Created initial session: {sid}")
+
+    msg_queue: queue.Queue[InboundMessage | None] = queue.Queue()
+    stop_event = threading.Event()
+
+    def cli_reader():
+        while not stop_event.is_set():
+            msg = cli.receive()
+            if msg is None:
+                continue
+            msg_queue.put(msg)
+        print_info("CLI reader stopped.")
 
     print_info("=" * 60)
-    print_info(f"  Model: {MODEL_ID}")
-    print_info(f"  Session: {store.current_session_id}")
-    print_info(f"  Workdir: {WORKDIR}")
-    print_info(f"  Tools: {', '.join(TOOL_HANDLERS.keys())}")
+    print_info(f" Model: {MODEL_ID}")
+    print_info(f" Session: {store.current_session_id}")
+    print_info(f" Channels: {', '.join(mgr.list_channels())}")
+    print_info(f" Workdir: {WORKDIR}")
+    print_info(f" Tools: {', '.join(TOOL_HANDLERS.keys())}")
     print_info("  输入 /help 获取指令提示, 输入 'quit' 或 'exit' 退出. Ctrl+C 同样有效.")
     print_info("=" * 60)
     print()
 
-    while True:
-        try:
-            user_input = input(colored_prompt()).strip()
-        except(KeyboardInterrupt, EOFError):
-            print(f"\n{DIM}再见.{RESET}")
-            break
+    cli_thread = threading.Thread(target=cli_reader, daemon=True)
+    cli_thread.start()
 
-        if not user_input:
-            continue
-
-        if user_input.lower() in ("quit", "exit"):
-            print(f"{DIM}再见.{RESET}")
-            break
-
-        # --- REPL 命令 ---
-        if user_input.startswith("/"):
-            handled, messages = handle_repl_command(
-                user_input, store, guard, messages
-            )
-            if handled:
-                continue
-
-        # --- 添加聊天记录到历史 ---
-        user_message = {
-            "role": "user",
-            "content": user_input,
-        }
-        messages.append(user_message)
-
-        user_record = user_message.copy()
-        store.append_transcript(store.current_session_id, user_record)
-
-        # --- Agent 工具使用循环 ---
-        while True:
+    try:
+        while not stop_event.is_set():
             try:
-                response = guard.guard_api_call(
-                    api_key = API_KEY,
-                    model = MODEL_ID,
-                    max_tokens = 8096,
-                    system = SYSTEM_PROMPT,
-                    tools = TOOLS,
-                    messages = messages,
-                )
-            except Exception as exc:
-                print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
-                while messages and messages[-1]["role"] != "user":
-                    messages.pop()
-                if messages:
-                    messages.pop()
-                break
-
-            # print(response) # 响应测试
-
-            if response.status_code != 200:
-                print_info(f"\nAPI Error {response.status_code}: {response.message}\n")
-                while messages and messages[-1]["role"] != "system":
-                    messages.pop()
-                break
-
-            choice = response.output.choices[0]
-            finish_reason = choice.finish_reason
-            assistant_message = choice.message
-
-            assistant_dict = {
-                "role": "assistant",
-                "content": assistant_message.content if hasattr(assistant_message, "content") else None
-            }
-            tool_calls = assistant_message.get("tool_calls" if isinstance(assistant_message, dict) else None)
-            if tool_calls:
-                assistant_dict["tool_calls"] = assistant_message.tool_calls
-            messages.append(assistant_dict)
-
-            assistant_record = assistant_dict.copy()
-            store.append_transcript(store.current_session_id, assistant_record)
-
-            # --- 调用终止条件stop_reason ---
-            if finish_reason == "stop":
-               text = extract_assistant_text(assistant_message)
-               if text:
-                   print_assistant(text)
-               break
-
-            elif finish_reason == "tool_calls":
-                tool_calls = assistant_message.get("tool_calls", [])
-
-                for tool_call in tool_calls:
-                    # print(f"\n{tool_call}\n") # 测试代码
-                    function = tool_call["function"]
-                    tool_name = function["name"]
-                    tool_args = json.loads(function.get("arguments", "{}")) # arguments 是 JSON 格式
-                    tool_call_id = tool_call.get("id")
-
-                    result = process_tool_call(tool_name, tool_args) # 工具调用
-
-                    tool_message = {
-                        "role": "tool",
-                        "content": result,
-                        "tool_call_id": tool_call_id,
-                    }
-                    messages.append(tool_message)
-
-                    tool_record = tool_message.copy()
-                    store.append_transcript(store.current_session_id, tool_record)
-
+                msg = msg_queue.get(timeout=0.5)  # 从消息队列中读取不同通道消息
+            except queue.Empty:
                 continue
 
-            else:
-                print_info(f"[finish_reason]={finish_reason}")
-                text = extract_assistant_text(assistant_message)
-                if text:
-                    print_assistant(text)
+            if msg is None:
                 break
+
+            if msg.channel == "cli":
+                if msg.text.lower() in ("quit", "exit"):
+                    stop_event.set()
+                    break
+
+                if msg.text.startswith("/"):
+                    current_messages = conversations.get(cli_sk, [])
+                    handled, new_messages = handle_repl_command(
+                        msg.text, store, guard, current_messages, mgr
+                    )
+                    if handled:
+                        conversations[cli_sk] = new_messages
+                        cli.allow_input()
+                        continue
+
+            if msg.channel == "cli":
+                run_agent_turn(msg, conversations, mgr, store=store)
+                cli.allow_input()
+            else:
+                run_agent_turn(msg, conversations, mgr)
+
+    except KeyboardInterrupt:
+        print("")
+    finally:
+        stop_event.set()
+        cli_thread.join(timeout=2.0)
+        mgr.close_all()
+        print(f"{DIM}再见.{RESET}")
 
 # ---------------------------------------------------------------------------
 # 入口

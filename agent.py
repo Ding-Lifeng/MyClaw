@@ -1300,7 +1300,7 @@ def agent_loop() -> None:
     print_info(f" Channels: {', '.join(mgr.list_channels())}")
     print_info(f" Workdir: {WORKDIR}")
     print_info(f" Tools: {', '.join(TOOL_HANDLERS.keys())}")
-    print_info("  输入 /help 获取指令提示, 输入 'quit' 或 'exit' 退出. Ctrl+C 同样有效.")
+    print_info("  输入 /help 获取指令提示, 输入 'quit' 或 'exit' 退出.")
     print_info("=" * 60)
     print()
 
@@ -1339,7 +1339,7 @@ def agent_loop() -> None:
                 run_agent_turn(msg, conversations, mgr)
 
     except KeyboardInterrupt:
-        print("")
+        print(f"")
     finally:
         stop_event.set()
         cli_thread.join(timeout=2.0)

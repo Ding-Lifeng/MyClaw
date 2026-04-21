@@ -1,9 +1,10 @@
-import os, sys, subprocess, json, uuid, time, queue, threading
+import os, sys, subprocess, json, uuid, time, asyncio
+import queue, threading, re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 from dotenv import load_dotenv
 import dashscope
-from datetime import datetime,timezone
+from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -19,9 +20,18 @@ except ImportError:
 
 # 加载环境变量
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
-MODEL_ID = os.getenv("MODEL_ID", "qwen3.5-plus")
+
+MODEL_ID = os.getenv("MODEL_ID", "MiniMax-M2.5")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").lower()
+
 API_KEY = os.getenv("DASHSCOPE_API_KEY")
 BASE_URL = os.getenv("DASHSCOPE_BASE_URL")
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 
 dashscope.base_http_api_url = BASE_URL
 
@@ -40,6 +50,9 @@ CONTEXT_SAFE_LIMIT = 180000
 
 # 工作目录 -- 限制Agent权限
 WORKDIR = Path.cwd()
+
+# Agents 目录 -- 多Agent
+AGENTS_DIR = WORKDIR / ".agents"
 
 # 状态目录 -- 存储Agent运行过程文件
 STATE_DIR = WORKDIR / ".state"
@@ -88,6 +101,151 @@ def print_channel(text: str) -> None:
     print(f"{BLUE}{text}{RESET}")
 
 # ---------------------------------------------------------------------------
+# 标准化 Agent ID
+# ---------------------------------------------------------------------------
+
+VALID_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+INVALID_CHARS_RE = re.compile(r"[^a-z0-9_-]+")
+DEFAULT_AGENT_ID = "main"
+
+def normalize_agent_id(value: str) -> str:
+    trimmed = value.strip()
+    if not trimmed:
+        return DEFAULT_AGENT_ID
+    if VALID_ID_RE.match(trimmed):
+        return trimmed.lower()
+    cleaned = INVALID_CHARS_RE.sub("-", trimmed.lower().strip("-")[:64])
+    return cleaned or DEFAULT_AGENT_ID
+
+# ---------------------------------------------------------------------------
+# 五层路由解析（peer_id, guild_id, account_id, channel, default）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Binding:
+    agent_id: str
+    tier: int
+    match_key: str # "peer_id" | "guild_id" | "account_id" | "channel" | "default"
+    match_value: str
+    priority: int = 0 # 大数优先
+
+    def display(self) -> str:
+        names = {1: "peer", 2: "guild", 3: "account", 4: "channel", 5: "default"}
+        label = names.get(self.tier, f"tier-{self.tier}")
+        return f"[{label}] {self.match_key}={self.match_value} -> agent:{self.agent_id} (pri={self.priority})"
+
+class BindingTable:
+    def __init__(self) -> None:
+        self._bindings: list[Binding] = []
+
+    def add(self, binding: Binding) -> None:
+        self._bindings.append(binding)
+        self._bindings.sort(key=lambda b: (b.tier, -b.priority))
+
+    def remove(self, agent_id: str, match_key: str, match_value: str) -> bool:
+        before = len(self._bindings)
+        self._bindings = [
+            b for b in self._bindings
+            if not (b.agent_id == agent_id and b.match_key == match_key
+                    and b.match_value == match_value)
+        ]
+        return len(self._bindings) < before
+
+    def list_all(self) -> list[Binding]:
+        return list(self._bindings)
+
+    # 动态选择代理
+    def resolve(self, channel: str = "", account_id: str = "",
+                guild_id: str = "", peer_id: str = "") -> tuple[str | None, Binding | None]:
+        for b in self._bindings:
+            if b.tier == 1 and b.match_key == "peer_id":
+                if ":" in b.match_value:
+                    if b.match_value == f"{channel}:{peer_id}":
+                        return b.agent_id, b
+                elif b.match_value == peer_id:
+                    return b.agent_id, b
+            elif b.tier == 2 and b.match_key == "guild_id" and b.match_value == guild_id:
+                return b.agent_id, b
+            elif b.tier == 3 and b.match_key == "account_id" and b.match_value == account_id:
+                return b.agent_id, b
+            elif b.tier == 4 and b.match_key == "channel" and b.match_value == channel:
+                return b.agent_id, b
+            elif b.tier == 5 and b.match_key == "default":
+                return b.agent_id, b
+        return None, None
+
+# ---------------------------------------------------------------------------
+# 构建会话键 - dm_scope 控制隔离策略
+# ---------------------------------------------------------------------------
+
+def build_session_key(agent_id: str, channel: str = "", account_id: str = "",
+                      peer_id: str = "", dm_scope: str = "per-peer") -> str:
+    aid = normalize_agent_id(agent_id)
+    ch = (channel or "unknown").strip().lower()
+    acc = (account_id or "default").strip().lower()
+    pid = (peer_id or "").strip().lower()
+    if dm_scope == "per-account-channel-peer" and pid:
+        return f"agent:{aid}:{ch}:{acc}:direct:{pid}"
+    if dm_scope == "per-channel-peer" and pid:
+        return f"agent:{aid}:{ch}:direct:{pid}"
+    if dm_scope == "per-peer" and pid:
+        return f"agent:{aid}:direct:{pid}"
+    return f"agent:{aid}:main"
+
+# ---------------------------------------------------------------------------
+# Agent 配置和管理
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentConfig:
+    id: str
+    name: str
+    personality: str = ""
+    model: str = ""
+    dm_scope: str = "per-peer"
+
+    @property
+    def effective_model(self) -> str:
+        return self.model or MODEL_ID
+
+    def system_prompt(self) -> str:
+        parts = [f"You are {self.name}."]
+        if self.personality:
+            parts.append(f"Your personality: {self.personality}")
+        parts.append("Answer questions helpfully and stay in character.")
+        return " ".join(parts)
+
+class AgentManager:
+    def __init__(self, agents_base: Path | None = None) -> None:
+        self._agents: dict[str, AgentConfig] = {}
+        self._agents_base = agents_base or AGENTS_DIR
+        self._sessions: dict[str, list[dict]] = {}
+
+    def register(self, config: AgentConfig) -> None:
+        aid = normalize_agent_id(config.id)
+        config.id = aid
+        self._agents[aid] = config
+        agent_dir = self._agents_base / aid
+        (agent_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        (WORKDIR / f"workspace-{aid}").mkdir(parents=True, exist_ok=True)
+
+    def get_agent(self, agent_id: str) -> AgentConfig | None:
+        return self._agents.get(normalize_agent_id(agent_id))
+
+    def list_agents(self) -> list[AgentConfig]:
+        return list(self._agents.values())
+
+    def get_session(self, session_key: str) -> list[dict]:
+        if session_key not in self._sessions:
+            self._sessions[session_key] = []
+        return self._sessions[session_key]
+
+    def list_sessions(self, agent_id: str = "") -> dict[str, int]:
+        aid = normalize_agent_id(agent_id) if agent_id else ""
+        return {k: len(v) for k, v in self._sessions.items()
+                if not aid or k.startswith(f"agent:{aid}:")}
+
+# ---------------------------------------------------------------------------
 # 数据结构
 # ---------------------------------------------------------------------------
 
@@ -110,13 +268,6 @@ class ChannelAccount:
     account_id: str
     token: str = ""
     config: dict = field(default_factory=dict)
-
-# ---------------------------------------------------------------------------
-# 实时会话存储
-# ---------------------------------------------------------------------------
-
-def build_session_key(channel: str, account_id: str, peer_id: str) -> str:
-    return f"agent:main:direct:{channel}:{peer_id}"
 
 # ---------------------------------------------------------------------------
 # Channel 类
@@ -447,6 +598,243 @@ def _serialize_messages_for_summary(messages: list[dict]) -> str:
     return "\n".join(parts)
 
 # ---------------------------------------------------------------------------
+# LLM Adapter
+# ---------------------------------------------------------------------------
+
+class LLMClient(ABC):
+    @abstractmethod
+    def chat(
+            self,
+            model: str,
+            system: str,
+            messages: list[dict],
+            max_tokens: int = 8096,
+            tools: list[dict] | None = None,
+             ) -> dict:
+        pass
+
+# Anthropic Adapter
+try:
+    from anthropic import Anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
+class AnthropicClient(LLMClient):
+    def __init__(self, api_key: str, base_url: str | None = None):
+        if not HAS_ANTHROPIC:
+            raise RuntimeError("Please install anthropic: pip install anthropic")
+        self.client = Anthropic(api_key=api_key, base_url=base_url)
+
+    def _convert_messages(self, messages: list[dict]) -> list[dict]:
+        converted = []
+        for msg in messages:
+            role = msg["role"]
+            if role not in ("user", "assistant"):
+                continue
+
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                converted.append({
+                    "role": role,
+                    "content": [{"type": "text", "text": content}]
+                })
+            elif isinstance(content, list):
+                anthropic_content = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "tool_use":
+                            anthropic_content.append(block)
+                        elif block.get("type") == "tool_result":
+                            anthropic_content.append(block)
+                        elif block.get("type") == "text":
+                            anthropic_content.append(block)
+                        else:
+                            anthropic_content.append({"type": "text", "text": str(block)})
+                    else:
+                        anthropic_content.append({"type": "text", "text": str(block)})
+                converted.append({
+                    "role": role,
+                    "content": anthropic_content or [{"type": "text", "text": ""}],
+                })
+        return converted
+
+    def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:
+        if not tools:
+            return None
+        anthropic_tools = []
+        for tool in tools:
+            if tool.get("type") == "function":
+                func = tool["function"]
+                anthropic_tools.append({
+                    "name": func["name"],
+                    "description": func.get("description", ""),
+                    "input_schema": func.get("parameters", {"type": "object", "properties": {}})
+                })
+        return anthropic_tools
+
+    def chat(self, model: str, system: str, messages: list[dict], max_tokens: int = 8096, tools: list[dict] | None = None) -> dict:
+        converted_msgs = self._convert_messages(messages)
+        anthropic_tools = self._convert_tools(tools)
+
+        resp = self.client.messages.create(
+            model=model,
+            system=system,
+            messages=converted_msgs,
+            max_tokens=max_tokens,
+            tools=anthropic_tools,
+        )
+
+        text_parts = []
+        tool_calls = []
+        for block in resp.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+            elif block.type == "tool_use":
+                tool_calls.append({
+                    "id": block.id,
+                    "type": "function",
+                    "function": {
+                        "name": block.name,
+                        "arguments": json.dumps(block.input)
+                    }
+                })
+
+        finish_reason = resp.stop_reason
+        if finish_reason == "end_turn":
+            finish_reason = "stop"
+        elif finish_reason == "tool_use":
+            finish_reason = "tool_calls"
+
+        return {
+            "text": "\n".join(text_parts),
+            "tool_calls": tool_calls,
+            "finish_reason": finish_reason,
+            "raw": resp
+        }
+
+# OpenAI Adapter
+try:
+    from openai import OpenAI
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+
+class OpenAIClient(LLMClient):
+    def __init__(self, api_key: str, base_url: str | None = None):
+        if not HAS_OPENAI:
+            raise RuntimeError("Please install openai: pip install openai")
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+
+    def chat(self, model: str, system: str, messages: list[dict], max_tokens: int = 8096, tools: list[dict] | None = None) -> dict:
+        full_messages = [{"role": "system", "content": system}] + messages
+
+        resp = self.client.chat.completions.create(
+            model=model,
+            messages=full_messages,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
+
+        msg = resp.choices[0].message
+        tool_calls = []
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_calls.append({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                })
+
+        return {
+            "text": msg.content or "",
+            "tool_calls": tool_calls,
+            "finish_reason": resp.choices[0].finish_reason,
+            "raw": resp
+        }
+
+# DashScope Adapter
+class DashScopeClient(LLMClient):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def chat(self, model: str, system: str, messages: list[dict], max_tokens: int = 8096, tools: list[dict] | None = None) -> dict:
+        full_messages = [{"role": "system", "content": system}] + messages
+
+        resp = dashscope.MultiModalConversation.call(
+            api_key=self.api_key,
+            model=model,
+            messages=full_messages,
+            max_tokens=max_tokens,
+            result_format="message",
+            tools=tools,
+        )
+
+        if resp.status_code != 200:
+            raise Exception(f"DashScope error {resp.status_code}: {resp.message}")
+
+        choice = resp.output.choices[0]
+        msg = choice.message
+        finish_reason = choice.finish_reason
+
+        text = ""
+        if hasattr(msg, "content"):
+            if isinstance(msg.content, list):
+                text = "\n".join(x.get("text", "") for x in msg.content if isinstance(x, dict))
+            else:
+                text = str(msg.content)
+
+        tool_calls = []
+        if finish_reason == "tool_calls" and hasattr(msg, "tool_calls"):
+            for tc in msg.tool_calls:
+                tool_calls.append({
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"].get("arguments", "{}")
+                    }
+                })
+
+        return {
+            "text": text,
+            "tool_calls": tool_calls,
+            "finish_reason": finish_reason,
+            "raw": resp
+        }
+
+# LLM 工厂
+def create_llm_client() -> LLMClient:
+    provider = LLM_PROVIDER
+    if not provider:
+        if ANTHROPIC_API_KEY:
+            provider = "anthropic"
+        elif OPENAI_API_KEY:
+            provider = "openai"
+        elif API_KEY:
+            provider = "dashscope"
+        else:
+            raise RuntimeError("No LLM API key found. Please set ANTHROPIC_API_KEY, OPENAI_API_KEY, or DASHSCOPE_API_KEY.")
+
+    if provider == "anthropic":
+        if not ANTHROPIC_API_KEY:
+            raise RuntimeError("ANTHROPIC_API_KEY is required for Anthropic provider.")
+        return AnthropicClient(ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL)
+    elif provider == "openai":
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is required for OpenAI provider.")
+        return OpenAIClient(OPENAI_API_KEY, OPENAI_BASE_URL)
+    elif provider == "dashscope":
+        if not API_KEY:
+            raise RuntimeError("DASHSCOPE_API_KEY is required for DashScope provider.")
+        return DashScopeClient(API_KEY)
+    else:
+        raise RuntimeError(f"Unknown LLM provider: {provider}")
+
+# ---------------------------------------------------------------------------
 # 处理会话消息-防止上下文溢出
 # ---------------------------------------------------------------------------
 
@@ -478,13 +866,6 @@ class ContextGuard:
                             total += self.estimate_tokens(
                                 json.dumps(block.get("input", {}))
                             )
-                    else:
-                        if hasattr(block, "text"):
-                            total += self.estimate_tokens(block.text)
-                        elif hasattr(block, "input"):
-                            total += self.estimate_tokens(
-                                json.dumps(block.input)
-                            )
         return total
 
     # 截断文本 - 并尽量保持可读性
@@ -500,7 +881,7 @@ class ContextGuard:
 
     # 总结历史消息 - 形成摘要
     @staticmethod
-    def compact_history(messages: list[dict]) -> list[dict]:
+    def compact_history(messages: list[dict], client: LLMClient, model: str) -> list[dict]:
         total = len(messages)
         if total <= 4:
             return messages
@@ -525,24 +906,15 @@ class ContextGuard:
         )
 
         try:
-            response = dashscope.MultiModalConversation.call(
-                api_key=API_KEY,
-                model=MODEL_ID,
-                messages=[
-                    {"role": "system", "content": "You are a conversation summarizer. Be concise and factual."},
-                    {"role": "user", "content": summary_prompt}
-                ],
-                max_tokens=2048,
-                result_format='message'
+            response = client.chat(
+                model = model,
+                system = "You are a conversation summarizer. Be concise and factual.",
+                messages = [{"role": "user", "content": summary_prompt}],
+                max_tokens = 2048,
+                tools = None
             )
-            if response.status_code != 200:
-                raise Exception(f"API Error {response.status_code}: {response.message}")
 
-            content = response.output.content[0].content
-            if isinstance(content, list):
-                summary_text = "\n".join(item["text"] for item in content if isinstance(item, dict) and "text" in item)
-            else:
-                summary_text = str(content)
+            summary_text = response["text"]
 
             print_session(
                 f" [compact] {len(old_messages)} messages -> summary "
@@ -570,48 +942,62 @@ class ContextGuard:
     def _truncate_large_tool_results(self, messages: list[dict]) -> list[dict]:
         result = []
         for msg in messages:
-            if msg.get("role") == "tool":
-                content = msg.get("content")
-                if isinstance(content, str):
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if role == "tool" and isinstance(content, str):
+                new_msg = msg.copy()
+                new_msg["content"] = self.truncate_tool_result(content)
+                result.append(new_msg)
+                continue
+
+            if role == "user" and isinstance(content, list):
+                new_blocks = []
+                changed = False
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_result"
+                        and isinstance(block.get("content"), str)
+                    ):
+                        new_block = block.copy()
+                        new_block["content"] = self.truncate_tool_result(block["content"])
+                        new_blocks.append(new_block)
+                        changed = True
+                    else:
+                        new_blocks.append(block)
+                if changed:
                     new_msg = msg.copy()
-                    new_msg["content"] = self.truncate_tool_result(content)
+                    new_msg["content"] = new_blocks
                     result.append(new_msg)
                 else:
                     result.append(msg)
-            else:
-                result.append(msg)
+                continue
+
+            result.append(msg)
         return result
 
     def guard_api_call(
             self,
-            api_key: str,
+            client: LLMClient,
             model: str,
             system: str,
             messages: list[dict],
             max_tokens: int = 8096,
             tools: list[dict] | None = None,
             max_retries: int = 2,
-    ) -> Any:
-        current_messages = messages
+    ) -> dict:
+        current_messages = messages.copy()
 
         for attempt in range(max_retries + 1):
             try:
-                full_messages = [{"role": "system", "content": system}] + current_messages
-
-                kwargs = {
-                    "api_key": api_key,
-                    "model": model,
-                    "max_tokens": 8096,
-                    "messages": full_messages,
-                    "result_format": "message",
-                }
-                if tools:
-                    kwargs["tools"] = tools
-
-                response = dashscope.MultiModalConversation.call(**kwargs)
-
-                if response.status_code != 200:
-                    raise Exception(f"API Error {response.status_code}: {response.message}")
+                response = client.chat(
+                    model = model,
+                    system = system,
+                    messages = current_messages,
+                    max_tokens = max_tokens,
+                    tools = tools,
+                )
 
                 if current_messages is not messages:
                     messages.clear()
@@ -636,7 +1022,7 @@ class ContextGuard:
                         "  [guard] Still overflowing, "
                         "compacting conversation history..."
                     )
-                    current_messages = self.compact_history(current_messages)
+                    current_messages = self.compact_history(current_messages, client, model)
 
         raise RuntimeError("guard_api_call: exhausted retries")
 
@@ -979,6 +1365,281 @@ def process_tool_call(tool_name: str, tool_input: dict[str, Any]) -> str:
         return f"Error: {tool_name} failed: {exc}"
 
 # ---------------------------------------------------------------------------
+# 共享事件循环 (持久化后台线程)
+# ---------------------------------------------------------------------------
+
+_event_loop: asyncio.AbstractEventLoop | None = None
+_loop_thread: threading.Thread | None = None
+
+def get_event_loop() -> asyncio.AbstractEventLoop:
+    global _event_loop, _loop_thread
+    if _event_loop is not None and _event_loop.is_running():
+        return _event_loop
+    _event_loop = asyncio.new_event_loop()
+    def _run():
+        asyncio.set_event_loop(_event_loop)
+        _event_loop.run_forever()
+    _loop_thread = threading.Thread(target=_run, daemon=True)
+    _loop_thread.start()
+    return _event_loop
+
+def run_async(coro: Any) -> Any:
+    loop = get_event_loop()
+    return asyncio.run_coroutine_threadsafe(coro, loop).result()
+
+# ---------------------------------------------------------------------------
+# 路由解析
+# ---------------------------------------------------------------------------
+
+def resolve_route(bindings: BindingTable, mgr: AgentManager,
+                  channel: str, peer_id: str,
+                  account_id: str = "", guild_id: str = "") -> tuple[str, str]:
+    agent_id, matched = bindings.resolve(
+        channel=channel, account_id=account_id,
+        guild_id=guild_id, peer_id=peer_id,
+    )
+    if not agent_id:
+        agent_id = DEFAULT_AGENT_ID
+        print(f"{DIM}[route] No binding matched, default: {agent_id}{RESET}")
+    elif matched:
+        print(f"{DIM}[route] Matched: {matched.display()}{RESET}")
+    agent = mgr.get_agent(agent_id)
+    dm_scope = agent.dm_scope if agent else "per-peer"
+    sk = build_session_key(agent_id, channel=channel, account_id=account_id,
+                           peer_id=peer_id, dm_scope=dm_scope)
+    return agent_id, sk
+
+# ---------------------------------------------------------------------------
+# Agent 运行器 - 限制并发请求数量
+# ---------------------------------------------------------------------------
+
+_agent_semaphore: asyncio.Semaphore | None = None
+
+async def run_agent(mgr: AgentManager, agent_id: str, session_key: str,
+                    user_text: str, on_typing: Any = None,
+                    llm_client: LLMClient | None = None) -> str:
+    global _agent_semaphore
+    if _agent_semaphore is None:
+        _agent_semaphore = asyncio.Semaphore(4)
+    if llm_client is None:
+        llm_client = create_llm_client()
+    agent = mgr.get_agent(agent_id)
+    if not agent:
+        return f"Error: agent '{agent_id}' not found"
+    messages = mgr.get_session(session_key)
+    messages.append({"role": "user", "content": user_text})
+    async with _agent_semaphore:
+        if on_typing:
+            on_typing(agent_id, True)
+        try:
+            return await _agent_loop(llm_client, agent.effective_model, agent.system_prompt(), messages)
+        finally:
+            if on_typing:
+                on_typing(agent_id, False)
+
+async def _agent_loop(client: LLMClient, model: str, system: str, messages: list[dict]) -> str:
+    for _ in range(15):
+        try:
+            response = await asyncio.to_thread(
+                client.chat,
+                model=model,
+                system=system,
+                messages=messages,
+                max_tokens=4096,
+                tools=TOOLS,
+            )
+        except Exception as exc:
+            while messages and messages[-1]["role"] != "user":
+                messages.pop()
+            if messages:
+                messages.pop()
+            return f"API Error: {exc}"
+
+        finish_reason = response["finish_reason"]
+        assistant_text = response["text"]
+        tool_calls = response["tool_calls"]
+
+        assistant_msg = {"role": "assistant", "content": assistant_text}
+        if tool_calls:
+            if isinstance(client, AnthropicClient):
+                content_blocks = []
+                if assistant_text:
+                    content_blocks.append({"type": "text", "text": assistant_text})
+                for tc in tool_calls:
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "input": json.loads(tc["function"].get("arguments", "{}")),
+                    })
+                assistant_msg["content"] = content_blocks
+            else:
+                assistant_msg["tool_calls"] = tool_calls
+        messages.append(assistant_msg)
+
+        if finish_reason == "stop":
+            return assistant_text or "[no text]"
+
+        if finish_reason == "tool_calls":
+            if isinstance(client, AnthropicClient):
+                tool_results = []
+                for tc in tool_calls:
+                    tool_name = tc["function"]["name"]
+                    tool_args = json.loads(tc["function"].get("arguments", "{}"))
+                    tool_call_id = tc.get("id")
+                    result = process_tool_call(tool_name, tool_args)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": result,
+                    })
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                for tc in tool_calls:
+                    tool_name = tc["function"]["name"]
+                    tool_args = json.loads(tc["function"].get("arguments", "{}"))
+                    tool_call_id = tc.get("id")
+                    result = process_tool_call(tool_name, tool_args)
+                    messages.append({"role": "tool", "content": result, "tool_call_id": tool_call_id})
+            continue
+
+        return assistant_text or f"[finish_reason={finish_reason}]"
+    return "[max iterations reached]"
+
+# ---------------------------------------------------------------------------
+# Gateway 服务器 (WebSocket, JSON-RPC 2.0)
+# ---------------------------------------------------------------------------
+
+class GatewayServer:
+    def __init__(self, mgr: AgentManager, bindings: BindingTable,
+                 llm_client: LLMClient | None = None,
+                 host: str = "localhost", port: int = 8765) -> None:
+        self._mgr = mgr
+        self._bindings = bindings
+        self._llm_client = llm_client or create_llm_client()
+        self._host, self._port = host, port
+        self._clients: set[Any] = set()
+        self._start_time = time.monotonic()
+        self._server: Any = None
+        self._running = False
+
+    async def start(self) -> None:
+        try:
+            import websockets
+        except ImportError:
+            print(f"{RED}websockets not installed. pip install websockets{RESET}")
+        self._start_time = time.monotonic()
+        self._running = True
+        self._server = await websockets.serve(self._handle, self._host, self._port)
+        print(f"{GREEN}Gateway started ws://{self._host}:{self._port}{RESET}")
+
+    async def stop(self) -> None:
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+            self._running = False
+
+    async def _handle(self, ws: Any, path: str = "") -> None:
+        self._clients.add(ws)
+        try:
+            async for raw in ws:
+                resp = await self._dispatch(raw)
+                if resp:
+                    await ws.send(json.dumps(resp))
+        except Exception:
+            pass
+        finally:
+            self._clients.discard(ws)
+
+    def _typing_cb(self, agent_id: str, typing: bool) -> None:
+        msg = json.dumps({"jsonrpc": "2.0", "method": "typing",
+                          "params": {"agent_id": agent_id, "typing": typing}})
+        for ws in list(self._clients):
+            try:
+                asyncio.ensure_future(ws.send(msg))
+            except Exception:
+                self._clients.discard(ws)
+
+    async def _dispatch(self, raw: str) -> dict | None:
+        try:
+            req = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": None}
+        rid, method, params = req.get("id"), req.get("method", ""), req.get("params", {})
+        methods = {
+            "send": self._m_send, "bindings.set": self._m_bind_set,
+            "bindings.list": self._m_bind_list, "sessions.list": self._m_sessions,
+            "agents.list": self._m_agents, "status": self._m_status,
+        }
+        handler = methods.get(method)
+        if not handler:
+            return {"jsonrpc": "2.0", "error": {"code": -32601, "message": f"Unknown: {method}"}, "id": rid}
+        try:
+            return {"jsonrpc": "2.0", "result": await handler(params), "id": rid}
+        except Exception as exc:
+            return {"jsonrpc": "2.0", "error": {"code": -32000, "message": str(exc)}, "id": rid}
+
+    async def _m_send(self, p: dict) -> dict:
+        text = p.get("text", "")
+        if not text:
+            raise ValueError("text is required")
+        ch, pid = p.get("channel", "websocket"), p.get("peer_id", "ws-client")
+        if p.get("agent_id"):
+            aid = normalize_agent_id(p["agent_id"])
+            a = self._mgr.get_agent(aid)
+            sk = build_session_key(aid, channel=ch, peer_id=pid,
+                                   dm_scope=a.dm_scope if a else "per-peer")
+        else:
+            aid, sk = resolve_route(self._bindings, self._mgr, ch, pid)
+        reply = await run_agent(self._mgr, aid, sk, text, on_typing=self._typing_cb, llm_client=self._llm_client)
+        return {"agent_id": aid, "session_key": sk, "reply": reply}
+
+    async def _m_bind_set(self, p: dict) -> dict:
+        b = Binding(agent_id=normalize_agent_id(p.get("agent_id", "")),
+                    tier=int(p.get("tier", 5)), match_key=p.get("match_key", "default"),
+                    match_value=p.get("match_value", "*"), priority=int(p.get("priority", 0)))
+        self._bindings.add(b)
+        return {"ok": True, "binding": b.display()}
+
+    async def _m_bind_list(self, p: dict) -> list[dict]:
+        return [{"agent_id": b.agent_id, "tier": b.tier, "match_key": b.match_key,
+                 "match_value": b.match_value, "priority": b.priority}
+                for b in self._bindings.list_all()]
+
+    async def _m_sessions(self, p: dict) -> dict:
+        return self._mgr.list_sessions(p.get("agent_id", ""))
+
+    async def _m_agents(self, p: dict) -> list[dict]:
+        return [{"id": a.id, "name": a.name, "model": a.effective_model,
+                 "dm_scope": a.dm_scope, "personality": a.personality}
+                for a in self._mgr.list_agents()]
+
+    async def _m_status(self, p: dict) -> dict:
+        return {"running": self._running,
+                "uptime_seconds": round(time.monotonic() - self._start_time, 1),
+                "connected_clients": len(self._clients),
+                "agent_count": len(self._mgr.list_agents()),
+                "binding_count": len(self._bindings.list_all())}
+
+# ---------------------------------------------------------------------------
+# 默认 Agent 初始化
+# ---------------------------------------------------------------------------
+
+def setup_default_agent(agent_mgr: AgentManager, bindings: BindingTable) -> None:
+    """初始化默认 Agent"""
+    agent_mgr.register(AgentConfig(
+        id="main",
+        name="Main Agent",
+        personality="",
+    ))
+    bindings.add(Binding(
+        agent_id="main",
+        tier=5,
+        match_key="default",
+        match_value="*",
+    ))
+
+# ---------------------------------------------------------------------------
 # Read-Eval-Print Loop
 # ---------------------------------------------------------------------------
 
@@ -987,8 +1648,16 @@ def handle_repl_command(
         store: SessionStore,
         guard: ContextGuard,
         messages: list[dict],
-        mgr: ChannelManager
-) -> tuple[bool, list[dict]]:
+        mgr: ChannelManager,
+        llm_client: LLMClient,
+        model_id: str,
+        bindings: BindingTable | None = None,
+        agent_mgr: AgentManager | None = None,
+        force_agent_id: Optional[str] = None,
+        set_force_agent: Optional[Callable[..., Any]] = None,
+        gw_server: Optional["GatewayServer"] = None,
+        set_gw_server: Optional[Callable[..., Any]] = None,
+) -> tuple[bool, list[dict], Optional[str], Optional["GatewayServer"]]:
     parts = command.strip().split(maxsplit = 1)
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
@@ -997,12 +1666,12 @@ def handle_repl_command(
         label = arg or ""
         sid = store.create_session(label)
         print_session(f"Created new session: {sid}" + (f" ({label})" if label else ""))
-        return True,[]
+        return True, [], force_agent_id, gw_server
     elif cmd == "/list":
         sessions = store.list_sessions()
         if not sessions:
             print_info("No sessions found.")
-            return True, messages
+            return True, messages, force_agent_id, gw_server
 
         print_info("Sessions:")
         for sid, meta in sessions:
@@ -1015,12 +1684,12 @@ def handle_repl_command(
                 f" {sid}{label_str} "
                 f"msgs={count} last={last}{active}"
             )
-        return True, messages
+        return True, messages, force_agent_id, gw_server
 
     elif cmd == "/switch":
         if not arg:
             print_warn("Usage: /switch <session_id>")
-            return True,messages
+            return True, messages, force_agent_id, gw_server
         query = arg.strip()
 
         # 会话ID匹配
@@ -1037,15 +1706,15 @@ def handle_repl_command(
 
         if len(matched) == 0:
             print_warn(f"Session not found: {query}")
-            return True, messages
+            return True, messages, force_agent_id, gw_server
         if len(matched) > 1:
             print_warn(f"Ambiguous prefix, matches: {', '.join(matched)}")
-            return True, messages
+            return True, messages, force_agent_id, gw_server
 
         new_sid = matched[0]
         new_messages = store.load_session(new_sid)
         print_session(f" Switched to session: {new_sid} ({len(new_messages)} messages)")
-        return True, new_messages
+        return True, new_messages, force_agent_id, gw_server
 
     elif cmd == "/context":
         estimated = guard.estimate_messages_tokens(messages)
@@ -1057,16 +1726,16 @@ def handle_repl_command(
         print_info(f"  Context usage: ~{estimated:,} / {guard.max_tokens:,} tokens")
         print(f"  {color}[{bar}] {pct:.1f}%{RESET}")
         print_info(f"Messages: {len(messages)}")
-        return True, messages
+        return True, messages, force_agent_id, gw_server
 
     elif cmd == "/compact":
-        if len(messages) <= 4:
-            print_info("Too few messages to compact (need > 4).")
-            return True, messages
+        if len(messages) <= 2:
+            print_info("Too few messages to compact (need > 2).")
+            return True, messages, force_agent_id, gw_server
         print_session("Compacting history...")
-        new_messages = guard.compact_history(messages)
+        new_messages = guard.compact_history(messages, llm_client, model_id)
         print_session(f"{len(messages)} -> {len(new_messages)} messages")
-        return True, new_messages
+        return True, new_messages, force_agent_id, gw_server
 
     elif cmd == "/channels":
         channels = mgr.list_channels()
@@ -1076,7 +1745,7 @@ def handle_repl_command(
                 print_channel(f"  - {name}")
         else:
             print_info("No channels.")
-        return True, messages
+        return True, messages, force_agent_id, gw_server
 
     elif cmd == "/accounts":
         accounts = mgr.accounts
@@ -1087,37 +1756,150 @@ def handle_repl_command(
                 print_channel(f"- {acc.channel}/{acc.account_id}  token={masked}")
         else:
             print_info("No accounts.")
-        return True, messages
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/bindings":
+        if bindings is None:
+            print_warn("Bindings not available")
+            return True, messages, force_agent_id, gw_server
+        all_b = bindings.list_all()
+        if not all_b:
+            print_info("(no bindings)")
+        else:
+            print(f"\n{BOLD}Route Bindings ({len(all_b)}):{RESET}")
+            for b in all_b:
+                c = [MAGENTA, BLUE, CYAN, GREEN, DIM][min(b.tier - 1, 4)]
+                print(f"  {c}{b.display()}{RESET}")
+            print()
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/route":
+        if bindings is None or agent_mgr is None:
+            print_warn("Bindings or AgentManager not available")
+            return True, messages, force_agent_id, gw_server
+        parts = arg.strip().split()
+        if len(parts) < 2:
+            print_warn("Usage: /route <channel> <peer_id> [account_id] [guild_id]")
+            return True, messages, force_agent_id, gw_server
+        ch, pid = parts[0], parts[1]
+        acc = parts[2] if len(parts) > 2 else ""
+        gid = parts[3] if len(parts) > 3 else ""
+        aid, sk = resolve_route(bindings, agent_mgr, channel=ch, peer_id=pid, account_id=acc, guild_id=gid)
+        a = agent_mgr.get_agent(aid)
+        print(f"\n{BOLD}Route Resolution:{RESET}")
+        print(f"  {DIM}Input:   ch={ch} peer={pid} acc={acc or '-'} guild={gid or '-'}{RESET}")
+        print(f"  {CYAN}Agent:   {aid} ({a.name if a else '?'}){RESET}")
+        print(f"  {GREEN}Session: {sk}{RESET}\n")
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/agents":
+        if agent_mgr is None:
+            print_warn("AgentManager not available")
+            return True, messages, force_agent_id, gw_server
+        agents = agent_mgr.list_agents()
+        if not agents:
+            print_info("(no agents)")
+        else:
+            print(f"\n{BOLD}Agents ({len(agents)}):{RESET}")
+            for a in agents:
+                print(f"  {CYAN}{a.id}{RESET} ({a.name})  model={a.effective_model}  dm_scope={a.dm_scope}")
+                if a.personality:
+                    print(f"    {DIM}{a.personality[:70]}{'...' if len(a.personality) > 70 else ''}{RESET}")
+            print()
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/switch_agent":
+        if set_force_agent is None:
+            print_warn("Agent switching not available")
+            return True, messages, force_agent_id, gw_server
+        if not arg:
+            print_info(f"force_agent: {force_agent_id or '(off)'}")
+            return True, messages, force_agent_id, gw_server
+        if arg.lower() == "off":
+            set_force_agent(None)
+            print_info("Routing mode restored.")
+        else:
+            if agent_mgr is not None and agent_mgr.get_agent(arg):
+                set_force_agent(arg)
+                print_info(f"Forcing agent: {arg}")
+            else:
+                print_warn(f"Agent not found: {arg}")
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/gateway":
+        if set_gw_server is None:
+            print_warn("Gateway not available")
+            return True, messages, force_agent_id, gw_server
+        if arg == "start":
+            if gw_server is None:
+                if agent_mgr is None or bindings is None:
+                    print_warn("AgentManager or Bindings not available")
+                    return True, messages, force_agent_id, gw_server
+                new_gw = GatewayServer(agent_mgr, bindings)
+                asyncio.run_coroutine_threadsafe(new_gw.start(), get_event_loop()).result()
+                set_gw_server(new_gw)
+                print_info("Gateway started: ws://localhost:8765")
+            else:
+                print_info("Gateway already running")
+        elif arg == "stop":
+            if gw_server is not None:
+                asyncio.run_coroutine_threadsafe(gw_server.stop(), get_event_loop()).result()
+                set_gw_server(None)
+                print_info("Gateway stopped")
+            else:
+                print_info("Gateway not running")
+        elif arg == "status":
+            if gw_server:
+                print_info(f"Gateway running: ws://localhost:8765")
+                print_info(f"  Agents: {len(agent_mgr.list_agents()) if agent_mgr else 0}")
+                print_info(f"  Bindings: {len(bindings.list_all()) if bindings else 0}")
+            else:
+                print_info("Gateway not running")
+        else:
+            print_info("Usage: /gateway [start|stop|status]")
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/sessions":
+        if agent_mgr is None:
+            print_warn("AgentManager not available")
+            return True, messages, force_agent_id, gw_server
+        s = agent_mgr.list_sessions()
+        if not s:
+            print_info("(no sessions)")
+        else:
+            print(f"\n{BOLD}Sessions ({len(s)}):{RESET}")
+            for k, n in sorted(s.items()):
+                print(f"  {GREEN}{k}{RESET} ({n} msgs)")
+            print()
+        return True, messages, force_agent_id, gw_server
 
     elif cmd == "/help":
-        print_info("  Commands:")
+        print_info("  Session Commands:")
         print_info("    /new [label]       Create a new session")
         print_info("    /list              List all sessions")
         print_info("    /switch <id>       Switch to a session (prefix match)")
         print_info("    /context           Show context token usage")
         print_info("    /compact           Manually compact conversation history")
-        print_info("    /channels          List all active channels")
-        print_info("    /accounts          List configured bot accounts")
+        print_info("")
+        print_info("  Gateway Commands:")
+        print_info("    /bindings          List all route bindings")
+        print_info("    /route <ch> <peer> Test route resolution")
+        print_info("    /agents            List all agents")
+        print_info("    /switch_agent <id> Force use specific agent")
+        print_info("    /switch_agent off  Restore normal routing")
+        print_info("    /gateway start     Start WebSocket gateway")
+        print_info("    /gateway stop     Stop WebSocket gateway")
+        print_info("    /gateway status   Show gateway status")
+        print_info("    /sessions         List current sessions")
+        print_info("")
+        print_info("  Other Commands:")
+        print_info("    /channels          List all channels")
+        print_info("    /accounts          List configured accounts")
         print_info("    /help              Show this help")
         print_info("    quit / exit        Exit the REPL")
-        return True, messages
+        return True, messages, force_agent_id, gw_server
 
-    return False, messages
-
-# ---------------------------------------------------------------------------
-# 辅助函数 - 格式处理
-# ---------------------------------------------------------------------------
-
-# 从模型的返回值中提取文本
-def extract_assistant_text(message: dict) -> str:
-    content = message.get("content", "")
-    if isinstance(content, list):
-        texts = []
-        for item in content:
-            if isinstance(item, dict) and "text" in item:
-                texts.append(item["text"])
-        return "\n".join(texts)
-    return str(content)
+    return False, messages, force_agent_id, gw_server
 
 # ---------------------------------------------------------------------------
 # Agent 交互回合
@@ -1127,14 +1909,23 @@ def run_agent_turn(
         inbound: InboundMessage,
         conversations: dict[str, list[dict]],
         mgr: ChannelManager,
+        client: LLMClient,
         store: SessionStore | None = None,
+        model_id: str = MODEL_ID,
+        system_prompt: str = SYSTEM_PROMPT,
+        session_key: str | None = None,
 ) -> None:
-    sk = build_session_key(inbound.channel, inbound.account_id, inbound.peer_id)
+    sk = session_key or build_session_key(
+        DEFAULT_AGENT_ID,
+        channel=inbound.channel,
+        account_id=inbound.account_id,
+        peer_id=inbound.peer_id,
+    )
     if sk not in conversations:
         conversations[sk] = []
     messages = conversations[sk]
 
-    should_presist = (store is not None and inbound.channel == "cli")
+    should_persisit = (store is not None and inbound.channel == "cli")
 
     # --- 添加聊天记录到历史 ---
     user_message = {
@@ -1142,7 +1933,7 @@ def run_agent_turn(
         "content": inbound.text,
     }
     messages.append(user_message)
-    if should_presist:
+    if should_persisit:
         user_record = user_message.copy()
         store.append_transcript(store.current_session_id, user_record)
 
@@ -1151,10 +1942,10 @@ def run_agent_turn(
     while True:
         try:
             response = guard.guard_api_call(
-                api_key=API_KEY,
-                model=MODEL_ID,
+                client=client,
+                model=model_id,
                 max_tokens=8096,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 tools=TOOLS,
                 messages=messages,
             )
@@ -1166,72 +1957,93 @@ def run_agent_turn(
                 messages.pop()
             break
 
-        if response.status_code != 200:
-            print_info(f"\nAPI Error {response.status_code}: {response.message}\n")
-            while messages and messages[-1]["role"] != "system":
-                messages.pop()
-            break
+        finish_reason = response["finish_reason"]
+        assistant_content = response["text"]
+        tool_calls = response["tool_calls"]
 
-        choice = response.output.choices[0]
-        finish_reason = choice.finish_reason
-        assistant_message = choice.message
-
-        assistant_dict = {
+        assistant_msg = {
             "role": "assistant",
-            "content": assistant_message.content if hasattr(assistant_message, "content") else None
+            "content": assistant_content
         }
-        tool_calls = assistant_message.get("tool_calls" if isinstance(assistant_message, dict) else None)
+
         if tool_calls:
-            assistant_dict["tool_calls"] = assistant_message.tool_calls
-        messages.append(assistant_dict)
-        if should_presist:
-            assistant_record = assistant_dict.copy()
-            store.append_transcript(store.current_session_id, assistant_record)
+            if isinstance(client, AnthropicClient):
+                content_blocks = []
+                if assistant_content:
+                    content_blocks.append({"type": "text", "text": assistant_content})
+                for tc in tool_calls:
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "input": json.loads(tc["function"]["arguments"]),
+                    })
+                assistant_msg["content"] = content_blocks
+            else:
+                assistant_msg["tool_calls"] = tool_calls
+
+        messages.append(assistant_msg)
+        if should_persisit:
+            store.append_transcript(store.current_session_id, assistant_msg.copy())
 
         # --- 调用终止条件stop_reason ---
         if finish_reason == "stop":
-            text = extract_assistant_text(assistant_message)
-            if text:
+            if assistant_content:
                 ch = mgr.get(inbound.channel)
                 if ch:
-                    ch.send(inbound.peer_id, text)
+                    ch.send(inbound.peer_id, assistant_content)
                 else:
-                    print_assistant(text)
+                    print_assistant(assistant_content)
             break
 
         elif finish_reason == "tool_calls":
-            tool_calls = assistant_message.get("tool_calls", [])
+            if isinstance(client, AnthropicClient):
+                tool_results = []
+                for tc in tool_calls:
+                    tool_name = tc["function"]["name"]
+                    tool_args = json.loads(tc["function"]["arguments"])
+                    tool_call_id = tc["id"]
 
-            for tool_call in tool_calls:
-                # print(f"\n{tool_call}\n") # 测试代码
-                function = tool_call["function"]
-                tool_name = function["name"]
-                tool_args = json.loads(function.get("arguments", "{}"))  # arguments 是 JSON 格式
-                tool_call_id = tool_call.get("id")
+                    result = process_tool_call(tool_name, tool_args)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": result
+                    })
 
-                result = process_tool_call(tool_name, tool_args)  # 工具调用
-
-                tool_message = {
-                    "role": "tool",
-                    "content": result,
-                    "tool_call_id": tool_call_id,
+                tool_msg = {
+                    "role": "user",
+                    "content": tool_results
                 }
-                messages.append(tool_message)
-                if should_presist:
-                    tool_record = tool_message.copy()
-                    store.append_transcript(store.current_session_id, tool_record)
+                messages.append(tool_msg)
+                if should_persisit:
+                    store.append_transcript(store.current_session_id, tool_msg.copy())
+            else:
+                for tc in tool_calls:
+                    tool_name = tc["function"]["name"]
+                    tool_args = json.loads(tc["function"]["arguments"])
+                    tool_call_id = tc["id"]
 
+                    result = process_tool_call(tool_name, tool_args)
+                    tool_msg = {
+                        "role": "tool",
+                        "content": result,
+                        "tool_call_id": tool_call_id
+                    }
+                    messages.append(tool_msg)
+
+                    if should_persisit:
+                        store.append_transcript(store.current_session_id, tool_msg.copy())
             continue
 
         else:
             print_info(f"[finish_reason]={finish_reason}")
-            text = extract_assistant_text(assistant_message)
-            if text:
+            if assistant_content:
                 ch = mgr.get(inbound.channel)
                 if ch:
-                    ch.send(inbound.peer_id, text)
+                    ch.send(inbound.peer_id, assistant_content)
                 else:
-                    print_assistant(text)
+                    print_assistant(assistant_content)
             break
 
 # ---------------------------------------------------------------------------
@@ -1239,13 +2051,21 @@ def run_agent_turn(
 # ---------------------------------------------------------------------------
 
 def agent_loop() -> None:
-    mgr = ChannelManager()  # 初始化通道管理
+    try:
+        llm_client = create_llm_client()
+    except Exception as e:
+        print(f"{RED}Failed to create LLM client: {e}{RESET}")
+        sys.exit(1)
 
-    # 注册 CLI 通道
+    mgr = ChannelManager()
+    bindings = BindingTable()
+    agent_mgr = AgentManager()
+
+    setup_default_agent(agent_mgr, bindings)
+
     cli = CLIChannel()
     mgr.register(cli)
 
-    # 注册飞书通道
     fs_id = os.getenv("FEISHU_APP_ID", "").strip()
     fs_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
     if fs_id and fs_secret and HAS_HTTPX:
@@ -1264,14 +2084,19 @@ def agent_loop() -> None:
         mgr.register(FeishuChannel(fs_acc))
         print_channel("[+] Feishu channel registered (requires webhook server)")
 
-    # CLI 持久化
     store = SessionStore(agent_id="MyClaw")
     guard = ContextGuard()
 
-    # 内存会话存储 - Channel实时对话
     conversations: dict[str, list[dict]] = {}
 
-    cli_sk = build_session_key("cli", "cli-local", "cli-user")
+    cli_agent = agent_mgr.get_agent(DEFAULT_AGENT_ID)
+    cli_sk = build_session_key(
+        DEFAULT_AGENT_ID,
+        channel="cli",
+        account_id="cli-local",
+        peer_id="cli-user",
+        dm_scope=cli_agent.dm_scope if cli_agent else "per-peer",
+    )
     sessions = store.list_sessions()
     if sessions:
         sid = sessions[0][0]
@@ -1286,18 +2111,31 @@ def agent_loop() -> None:
     msg_queue: queue.Queue[InboundMessage | None] = queue.Queue()
     stop_event = threading.Event()
 
+    force_agent_id: str | None = None
+    gw_server: GatewayServer | None = None
+
+    def set_force_agent(aid: str | None) -> None:
+        nonlocal force_agent_id
+        force_agent_id = aid
+
+    def set_gw_server(gw: GatewayServer | None) -> None:
+        nonlocal gw_server
+        gw_server = gw
+
     def cli_reader():
         while not stop_event.is_set():
             msg = cli.receive()
             if msg is None:
                 continue
             msg_queue.put(msg)
-        print_info("CLI reader stopped.")
 
     print_info("=" * 60)
+    print_info(f" Provider: {type(llm_client).__name__}")
     print_info(f" Model: {MODEL_ID}")
     print_info(f" Session: {store.current_session_id}")
     print_info(f" Channels: {', '.join(mgr.list_channels())}")
+    print_info(f" Agents: {', '.join(a.id for a in agent_mgr.list_agents())}")
+    print_info(f" Bindings: {len(bindings.list_all())}")
     print_info(f" Workdir: {WORKDIR}")
     print_info(f" Tools: {', '.join(TOOL_HANDLERS.keys())}")
     print_info("  输入 /help 获取指令提示, 输入 'quit' 或 'exit' 退出.")
@@ -1310,7 +2148,7 @@ def agent_loop() -> None:
     try:
         while not stop_event.is_set():
             try:
-                msg = msg_queue.get(timeout=0.5)  # 从消息队列中读取不同通道消息
+                msg = msg_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
@@ -1324,25 +2162,78 @@ def agent_loop() -> None:
 
                 if msg.text.startswith("/"):
                     current_messages = conversations.get(cli_sk, [])
-                    handled, new_messages = handle_repl_command(
-                        msg.text, store, guard, current_messages, mgr
+                    handled, new_messages, new_force, new_gw = handle_repl_command(
+                        msg.text, store, guard, current_messages, mgr,
+                        llm_client, MODEL_ID,
+                        bindings=bindings, agent_mgr=agent_mgr,
+                        force_agent_id=force_agent_id,
+                        set_force_agent=set_force_agent,
+                        gw_server=gw_server,
+                        set_gw_server=set_gw_server,
                     )
+                    conversations[cli_sk] = new_messages
+                    if new_force is not None:
+                        force_agent_id = new_force
+                    if new_gw is not None:
+                        gw_server = new_gw
                     if handled:
-                        conversations[cli_sk] = new_messages
                         cli.allow_input()
                         continue
 
             if msg.channel == "cli":
-                run_agent_turn(msg, conversations, mgr, store=store)
+                if force_agent_id:
+                    aid = force_agent_id
+                    a = agent_mgr.get_agent(aid)
+                    if a:
+                        sk = build_session_key(aid, channel=msg.channel, account_id=msg.account_id,
+                                               peer_id=msg.peer_id, dm_scope=a.dm_scope)
+                        result = run_async(run_agent(agent_mgr, aid, sk, msg.text, llm_client=llm_client))
+                        print_assistant(result)
+                    else:
+                        print_warn(f"Agent '{aid}' not found")
+                else:
+                    cli_agent = agent_mgr.get_agent(DEFAULT_AGENT_ID)
+                    run_agent_turn(
+                        msg,
+                        conversations,
+                        mgr,
+                        llm_client,
+                        store=store,
+                        model_id=cli_agent.effective_model if cli_agent else MODEL_ID,
+                        system_prompt=cli_agent.system_prompt() if cli_agent else SYSTEM_PROMPT,
+                        session_key=cli_sk,
+                    )
                 cli.allow_input()
             else:
-                run_agent_turn(msg, conversations, mgr)
+                if force_agent_id:
+                    aid = force_agent_id
+                    a = agent_mgr.get_agent(aid)
+                    if a:
+                        sk = build_session_key(aid, channel=msg.channel, account_id=msg.account_id,
+                                               peer_id=msg.peer_id, dm_scope=a.dm_scope)
+                        result = run_async(run_agent(agent_mgr, aid, sk, msg.text, llm_client=llm_client))
+                        ch = mgr.get(msg.channel)
+                        if ch:
+                            ch.send(msg.peer_id, result)
+                    else:
+                        print_warn(f"Agent '{aid}' not found")
+                else:
+                    aid, sk = resolve_route(bindings, agent_mgr, channel=msg.channel,
+                                            account_id=msg.account_id, peer_id=msg.peer_id)
+                    result = run_async(run_agent(agent_mgr, aid, sk, msg.text, llm_client=llm_client))
+                    ch = mgr.get(msg.channel)
+                    if ch:
+                        ch.send(msg.peer_id, result)
+                    else:
+                        print_assistant(result)
 
     except KeyboardInterrupt:
-        print(f"")
+        print()
     finally:
         stop_event.set()
         cli_thread.join(timeout=2.0)
+        if gw_server:
+            run_async(gw_server.stop())
         mgr.close_all()
         print(f"{DIM}再见.{RESET}")
 
@@ -1351,11 +2242,6 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("DASHSCOPE_API_KEY"):
-        print(f"{YELLOW}Error: DASHSCOPE_API_KEY 未设置.{RESET}")
-        print(f"{DIM}环境配置未完成!{RESET}")
-        sys.exit(1)
-
     agent_loop()
 
 if __name__ == "__main__":

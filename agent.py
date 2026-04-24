@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from dotenv import load_dotenv
 import dashscope
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -14,6 +14,18 @@ try:
     HAS_HTTPX = True
 except ImportError:
     HAS_HTTPX = False
+
+try:
+    from croniter import croniter
+    HAS_CRONITER = True
+except ImportError:
+    croniter = None
+    HAS_CRONITER = False
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 # ---------------------------------------------------------------------------
 # API配置
@@ -73,10 +85,11 @@ MAX_TOOL_OUTPUT = 50000
 # 上下文限制
 CONTEXT_SAFE_LIMIT = 180000
 
-# 工作目录 -- 限制Agent权限
-WORKDIR = Path.cwd()
+# 工作目录 -- 固定为 MyClaw 目录, 避免从仓库根目录启动时把运行文件写到 claw0 同级
+WORKDIR = Path(__file__).resolve().parent
 WORKSPACE_DIR = WORKDIR / "workspace-main"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+CRON_DIR = WORKSPACE_DIR / "cron"
 
 # Agents 目录 -- 多Agent
 AGENTS_DIR = WORKDIR / ".agents"
@@ -129,6 +142,12 @@ def print_channel(text: str) -> None:
 
 def print_section(title: str) -> None:
     print(f"\n{MAGENTA}{BOLD}--- {title} ---{RESET}")
+
+def print_heartbeat(text: str) -> None:
+    print(f"{BLUE}{BOLD}[heartbeat]{RESET} {text}")
+
+def print_cron(text: str) -> None:
+    print(f"{MAGENTA}{BOLD}[cron]{RESET} {text}")
 
 # ---------------------------------------------------------------------------
 # Bootstrap 文件加载
@@ -830,10 +849,14 @@ class AgentConfig:
         return " ".join(parts)
 
 class AgentManager:
-    def __init__(self, agents_base: Path | None = None) -> None:
+    def __init__(self, agents_base: Path | None = None, session_store: Any = None) -> None:
         self._agents: dict[str, AgentConfig] = {}
         self._agents_base = agents_base or AGENTS_DIR
         self._sessions: dict[str, list[dict]] = {}
+        self._session_store = session_store
+
+    def set_session_store(self, session_store: Any) -> None:
+        self._session_store = session_store
 
     def register(self, config: AgentConfig) -> None:
         aid = normalize_agent_id(config.id)
@@ -851,8 +874,16 @@ class AgentManager:
 
     def get_session(self, session_key: str) -> list[dict]:
         if session_key not in self._sessions:
-            self._sessions[session_key] = []
+            if self._session_store is not None:
+                self._sessions[session_key] = self._session_store.load_session(session_key)
+                self._session_store.ensure_session(session_key)
+            else:
+                self._sessions[session_key] = []
         return self._sessions[session_key]
+
+    def save_session(self, session_key: str) -> None:
+        if self._session_store is not None and session_key in self._sessions:
+            self._session_store.save_session(session_key, self._sessions[session_key])
 
     def list_sessions(self, agent_id: str = "") -> dict[str, int]:
         aid = normalize_agent_id(agent_id) if agent_id else ""
@@ -1113,9 +1144,9 @@ def safe_path(raw: str) -> Path:
 # ---------------------------------------------------------------------------
 
 class SessionStore:
-    def __init__(self, agent_id: str = "default"):
-        self.agent_id = agent_id
-        self.base_dir = WORKDIR / ".sessions" / "agents" / agent_id / "sessions"
+    def __init__(self, agent_id: str = ""):
+        self.agent_id = normalize_agent_id(agent_id) if agent_id else ""
+        self.base_dir = WORKDIR / ".sessions" / "runtime"
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.base_dir / "session.json"
         self._index: dict[str, dict] = self._load_index()
@@ -1135,17 +1166,71 @@ class SessionStore:
             encoding="utf-8",
         )
 
-    def _session_path(self, session_id: str) -> Path:
-        return self.base_dir / f"{session_id}.jsonl"
+    @staticmethod
+    def _file_stem(session_id: str) -> str:
+        digest = hashlib.blake2b(session_id.encode("utf-8"), digest_size=8).hexdigest()
+        slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", session_id).strip("-")[:80]
+        return f"{slug or 'session'}-{digest}"
 
-    def create_session(self, label: str = "") -> str:
-        session_id = uuid.uuid4().hex[:12]
+    def _session_path(self, session_id: str) -> Path:
+        return self.base_dir / f"{self._file_stem(session_id)}.jsonl"
+
+    @staticmethod
+    def _parse_session_key(session_id: str) -> dict[str, str]:
+        parts = session_id.split(":")
+        meta = {"agent_id": "", "channel": "", "account_id": "", "peer_id": ""}
+        if len(parts) >= 2 and parts[0] == "agent":
+            meta["agent_id"] = parts[1]
+        if len(parts) >= 3:
+            meta["channel"] = parts[2]
+        if "direct" in parts:
+            idx = parts.index("direct")
+            if idx + 1 < len(parts):
+                meta["peer_id"] = parts[idx + 1]
+            if idx >= 1:
+                meta["account_id"] = parts[idx - 1] if idx >= 4 else ""
+        return meta
+
+    def ensure_session(self, session_id: str, label: str = "", metadata: dict[str, Any] | None = None) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        if session_id not in self._index:
+            parsed = self._parse_session_key(session_id)
+            parsed.update(metadata or {})
+            self._index[session_id] = {
+                "label": label,
+                "session_key": session_id,
+                "created_at": now,
+                "last_active": now,
+                "message_count": 0,
+                **parsed,
+            }
+            self._save_index()
+            self._session_path(session_id).touch()
+        else:
+            if label:
+                self._index[session_id]["label"] = label
+            if metadata:
+                self._index[session_id].update(metadata)
+            if label or metadata:
+                self._save_index()
+        self.current_session_id = session_id
+        return session_id
+
+    def create_session(
+            self,
+            label: str = "",
+            session_key: str | None = None,
+            metadata: dict[str, Any] | None = None,
+    ) -> str:
+        session_id = session_key or f"manual:{uuid.uuid4().hex[:12]}"
         now = datetime.now(timezone.utc).isoformat()
         self._index[session_id] = {
             "label": label,
+            "session_key": session_id,
             "created_at": now,
             "last_active": now,
             "message_count": 0,
+            **(metadata or self._parse_session_key(session_id)),
         }
         self._save_index()
         self._session_path(session_id).touch()
@@ -1161,6 +1246,7 @@ class SessionStore:
         return self._rebuild_history(path)
 
     def append_transcript(self, session_id: str, record: dict) -> None:
+        self.ensure_session(session_id)
         path = self._session_path(session_id)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -1170,6 +1256,22 @@ class SessionStore:
             )
             self._index[session_id]["message_count"] += 1
             self._save_index()
+
+    def save_session(
+            self,
+            session_id: str,
+            messages: list[dict],
+            label: str = "",
+            metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.ensure_session(session_id, label=label, metadata=metadata)
+        path = self._session_path(session_id)
+        with open(path, "w", encoding="utf-8") as f:
+            for msg in messages:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        self._index[session_id]["last_active"] = datetime.now(timezone.utc).isoformat()
+        self._index[session_id]["message_count"] = len(messages)
+        self._save_index()
 
     # 根据 JSONL 重建 messages
     @staticmethod
@@ -1192,8 +1294,11 @@ class SessionStore:
                 messages.append(msg)
         return messages
 
-    def list_sessions(self) -> list[tuple[str, dict]]:
+    def list_sessions(self, agent_id: str = "") -> list[tuple[str, dict]]:
         items = list(self._index.items())
+        if agent_id:
+            aid = normalize_agent_id(agent_id)
+            items = [(sid, meta) for sid, meta in items if meta.get("agent_id") == aid]
         items.sort(key=lambda x: x[1].get("last_active", ""), reverse=True)
         return items
 
@@ -2014,6 +2119,534 @@ def compose_runtime_system_prompt(
         channel=channel,
     )
 
+class HeartbeatRunner:
+    def __init__(
+            self,
+            workspace: Path,
+            lane_lock: threading.Lock,
+            agent_mgr: AgentManager,
+            llm_client: LLMClient,
+            interval: float = 1800.0,
+            active_hours: tuple[int, int] = (9, 22),
+            agent_id: str = DEFAULT_AGENT_ID,
+    ) -> None:
+        self.workspace = workspace
+        self.heartbeat_path = workspace / "HEARTBEAT.md"
+        self.lane_lock = lane_lock
+        self.agent_mgr = agent_mgr
+        self.llm_client = llm_client
+        self.interval = interval
+        self.active_hours = active_hours
+        self.agent_id = normalize_agent_id(agent_id)
+        self.last_run_at: float = 0.0
+        self.running = False
+        self._stopped = False
+        self._thread: threading.Thread | None = None
+        self._queue_lock = threading.Lock()
+        self._output_queue: list[str] = []
+        self._last_output = ""
+
+    def _session_key(self) -> str:
+        agent = self.agent_mgr.get_agent(self.agent_id)
+        return build_session_key(
+            self.agent_id,
+            channel="heartbeat",
+            account_id="system",
+            peer_id="timer",
+            dm_scope=agent.dm_scope if agent else "per-peer",
+        )
+
+    def should_run(self) -> tuple[bool, str]:
+        if not self.heartbeat_path.exists():
+            return False, "HEARTBEAT.md not found"
+        instructions = self.heartbeat_path.read_text(encoding="utf-8").strip()
+        if not instructions:
+            return False, "HEARTBEAT.md is empty"
+        now = time.time()
+        elapsed = now - self.last_run_at
+        if elapsed < self.interval:
+            return False, f"interval not elapsed ({self.interval - elapsed:.0f}s remaining)"
+        hour = datetime.now().hour
+        start, end = self.active_hours
+        in_hours = (start <= hour < end) if start <= end else not (end <= hour < start)
+        if not in_hours:
+            return False, f"outside active hours ({start}:00-{end}:00)"
+        if self.running:
+            return False, "already running"
+        return True, "all checks passed"
+
+    def _parse_response(self, response: str) -> str | None:
+        stripped = response.strip()
+        if not stripped:
+            return None
+        if "HEARTBEAT_OK" in stripped:
+            stripped = stripped.replace("HEARTBEAT_OK", "").strip()
+            return stripped or None
+        return stripped
+
+    def _build_prompt(self) -> str:
+        instructions = self.heartbeat_path.read_text(encoding="utf-8").strip()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            f"{instructions}\n\n"
+            "If there is nothing meaningful to report, reply with exactly HEARTBEAT_OK.\n"
+            f"Current time: {now_str}"
+        )
+
+    def _queue_output(self, text: str) -> None:
+        with self._queue_lock:
+            self._output_queue.append(text)
+
+    def _execute(self) -> None:
+        acquired = self.lane_lock.acquire(blocking=False)
+        if not acquired:
+            return
+        self.running = True
+        try:
+            response = run_async(run_agent(
+                self.agent_mgr,
+                self.agent_id,
+                self._session_key(),
+                self._build_prompt(),
+                channel="heartbeat",
+                llm_client=self.llm_client,
+            ))
+            meaningful = self._parse_response(response)
+            if meaningful is None:
+                return
+            if meaningful == self._last_output:
+                return
+            self._last_output = meaningful
+            self._queue_output(meaningful)
+        except Exception as exc:
+            self._queue_output(f"[heartbeat error: {exc}]")
+        finally:
+            self.running = False
+            self.last_run_at = time.time()
+            self.lane_lock.release()
+
+    def _loop(self) -> None:
+        while not self._stopped:
+            try:
+                ok, _ = self.should_run()
+                if ok:
+                    self._execute()
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stopped = False
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="heartbeat")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopped = True
+        if self._thread:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+
+    def drain_output(self) -> list[str]:
+        with self._queue_lock:
+            items = list(self._output_queue)
+            self._output_queue.clear()
+            return items
+
+    def trigger(self) -> str:
+        acquired = self.lane_lock.acquire(blocking=False)
+        if not acquired:
+            return "main lane occupied, cannot trigger"
+        self.running = True
+        try:
+            if not self.heartbeat_path.exists():
+                return "HEARTBEAT.md not found"
+            if not self.heartbeat_path.read_text(encoding="utf-8").strip():
+                return "HEARTBEAT.md is empty"
+            response = run_async(run_agent(
+                self.agent_mgr,
+                self.agent_id,
+                self._session_key(),
+                self._build_prompt(),
+                channel="heartbeat",
+                llm_client=self.llm_client,
+            ))
+            meaningful = self._parse_response(response)
+            if meaningful is None:
+                return "HEARTBEAT_OK (nothing to report)"
+            if meaningful == self._last_output:
+                return "duplicate content (skipped)"
+            self._last_output = meaningful
+            self._queue_output(meaningful)
+            return f"triggered, output queued ({len(meaningful)} chars)"
+        except Exception as exc:
+            return f"trigger failed: {exc}"
+        finally:
+            self.running = False
+            self.last_run_at = time.time()
+            self.lane_lock.release()
+
+    def status(self) -> dict[str, Any]:
+        now = time.time()
+        elapsed = now - self.last_run_at if self.last_run_at > 0 else None
+        next_in = max(0.0, self.interval - elapsed) if elapsed is not None else self.interval
+        ok, reason = self.should_run()
+        with self._queue_lock:
+            qsize = len(self._output_queue)
+        return {
+            "enabled": self.heartbeat_path.exists(),
+            "running": self.running,
+            "should_run": ok,
+            "reason": reason,
+            "last_run": datetime.fromtimestamp(self.last_run_at).isoformat() if self.last_run_at > 0 else "never",
+            "next_in": f"{round(next_in)}s",
+            "interval": f"{self.interval}s",
+            "active_hours": f"{self.active_hours[0]}:00-{self.active_hours[1]}:00",
+            "queue_size": qsize,
+            "agent_id": self.agent_id,
+        }
+
+CRON_AUTO_DISABLE_THRESHOLD = 5
+
+@dataclass
+class CronJob:
+    id: str
+    name: str
+    enabled: bool
+    schedule_kind: str
+    schedule_config: dict[str, Any]
+    payload: dict[str, Any]
+    delete_after_run: bool = False
+    consecutive_errors: int = 0
+    last_run_at: float = 0.0
+    next_run_at: float = 0.0
+
+
+class CronService:
+    def __init__(
+            self,
+            cron_file: Path,
+            lane_lock: threading.Lock,
+            agent_mgr: AgentManager,
+            llm_client: LLMClient,
+            default_agent_id: str = DEFAULT_AGENT_ID,
+    ) -> None:
+        self.cron_file = cron_file
+        self.lane_lock = lane_lock
+        self.agent_mgr = agent_mgr
+        self.llm_client = llm_client
+        self.default_agent_id = normalize_agent_id(default_agent_id)
+        self.jobs: list[CronJob] = []
+        self.running_job_id: str | None = None
+        self._queue_lock = threading.Lock()
+        self._output_queue: list[str] = []
+        CRON_DIR.mkdir(parents=True, exist_ok=True)
+        self._run_log = CRON_DIR / "cron-runs.jsonl"
+        self.load_jobs()
+
+    def load_jobs(self) -> None:
+        self.jobs.clear()
+        if not self.cron_file.exists():
+            return
+        try:
+            raw = json.loads(self.cron_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            self._queue_output(f"CRON.json load error: {exc}")
+            return
+        now = time.time()
+        for job_data in raw.get("jobs", []):
+            sched = job_data.get("schedule", {})
+            kind = sched.get("kind", "")
+            if kind not in ("at", "every", "cron"):
+                continue
+            job = CronJob(
+                id=str(job_data.get("id", "")).strip(),
+                name=str(job_data.get("name", "")).strip(),
+                enabled=bool(job_data.get("enabled", True)),
+                schedule_kind=kind,
+                schedule_config=sched,
+                payload=job_data.get("payload", {}),
+                delete_after_run=bool(job_data.get("delete_after_run", False)),
+            )
+            if not job.id:
+                continue
+            if not job.name:
+                job.name = job.id
+            job.next_run_at = self._compute_next(job, now)
+            self.jobs.append(job)
+
+    def reload(self) -> str:
+        self.load_jobs()
+        return f"loaded {len(self.jobs)} cron job(s)"
+
+    def _queue_output(self, text: str) -> None:
+        with self._queue_lock:
+            self._output_queue.append(text)
+
+    def _parse_iso_timestamp(self, value: Any) -> float:
+        if not value:
+            raise ValueError("empty timestamp")
+        return datetime.fromisoformat(str(value)).timestamp()
+
+    def _cron_base_time(self, cfg: dict[str, Any], now: float) -> datetime:
+        tz_name = cfg.get("tz")
+        if tz_name and ZoneInfo is not None:
+            try:
+                return datetime.fromtimestamp(now, tz=ZoneInfo(str(tz_name)))
+            except Exception:
+                pass
+        return datetime.fromtimestamp(now)
+
+    @staticmethod
+    def _parse_cron_field(field: str, min_value: int, max_value: int) -> set[int]:
+        values: set[int] = set()
+        for part in field.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "/" in part:
+                base, step_text = part.split("/", 1)
+                step = int(step_text)
+            else:
+                base, step = part, 1
+            if step <= 0:
+                raise ValueError("cron step must be positive")
+            if base == "*":
+                start, end = min_value, max_value
+            elif "-" in base:
+                start_text, end_text = base.split("-", 1)
+                start, end = int(start_text), int(end_text)
+            else:
+                start = end = int(base)
+            if start < min_value or end > max_value or start > end:
+                raise ValueError("cron field out of range")
+            values.update(range(start, end + 1, step))
+        return values
+
+    @classmethod
+    def _next_cron_fallback(cls, expr: str, base: datetime) -> float:
+        fields = expr.split()
+        if len(fields) != 5:
+            raise ValueError("fallback cron parser supports 5 fields")
+        minutes = cls._parse_cron_field(fields[0], 0, 59)
+        hours = cls._parse_cron_field(fields[1], 0, 23)
+        month_days = cls._parse_cron_field(fields[2], 1, 31)
+        months = cls._parse_cron_field(fields[3], 1, 12)
+        weekdays = cls._parse_cron_field(fields[4], 0, 7)
+        if 7 in weekdays:
+            weekdays.add(0)
+            weekdays.discard(7)
+
+        dom_restricted = fields[2].strip() != "*"
+        dow_restricted = fields[4].strip() != "*"
+        candidate = base.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        deadline = candidate + timedelta(days=366)
+        while candidate <= deadline:
+            cron_weekday = (candidate.weekday() + 1) % 7
+            dom_match = candidate.day in month_days
+            dow_match = cron_weekday in weekdays
+            if dom_restricted and dow_restricted:
+                day_match = dom_match or dow_match
+            else:
+                day_match = dom_match and dow_match
+            if (
+                    candidate.minute in minutes
+                    and candidate.hour in hours
+                    and candidate.month in months
+                    and day_match
+            ):
+                return candidate.timestamp()
+            candidate += timedelta(minutes=1)
+        return 0.0
+
+    def _compute_next(self, job: CronJob, now: float) -> float:
+        cfg = job.schedule_config
+        if job.schedule_kind == "at":
+            try:
+                ts = self._parse_iso_timestamp(cfg.get("at", ""))
+                return ts if ts > now else 0.0
+            except (ValueError, OSError, TypeError):
+                return 0.0
+
+        if job.schedule_kind == "every":
+            try:
+                every = float(cfg.get("every_seconds", 3600))
+            except (TypeError, ValueError):
+                return 0.0
+            if every <= 0:
+                return 0.0
+            try:
+                anchor = self._parse_iso_timestamp(cfg.get("anchor", ""))
+            except (ValueError, OSError, TypeError):
+                anchor = now
+            if now < anchor:
+                return anchor
+            steps = int((now - anchor) / every) + 1
+            return anchor + steps * every
+
+        if job.schedule_kind == "cron":
+            expr = str(cfg.get("expr", "")).strip()
+            if not expr:
+                return 0.0
+            try:
+                base = self._cron_base_time(cfg, now)
+                if HAS_CRONITER and croniter is not None:
+                    return croniter(expr, base).get_next(datetime).timestamp()
+                return self._next_cron_fallback(expr, base)
+            except Exception:
+                return 0.0
+
+        return 0.0
+
+    def tick(self) -> None:
+        now = time.time()
+        remove_ids: list[str] = []
+        for job in list(self.jobs):
+            if not job.enabled or job.next_run_at <= 0 or now < job.next_run_at:
+                continue
+            ran = self._run_job(job, now)
+            if ran and job.delete_after_run and job.schedule_kind == "at":
+                remove_ids.append(job.id)
+        if remove_ids:
+            self.jobs = [job for job in self.jobs if job.id not in remove_ids]
+
+    def _session_key(self, job: CronJob, agent_id: str) -> str:
+        agent = self.agent_mgr.get_agent(agent_id)
+        return build_session_key(
+            agent_id,
+            channel="cron",
+            account_id="system",
+            peer_id=job.id,
+            dm_scope=agent.dm_scope if agent else "per-peer",
+        )
+
+    def _run_agent_payload(self, job: CronJob, payload: dict[str, Any]) -> str:
+        message = str(payload.get("message", "")).strip()
+        if not message:
+            return "[empty message]"
+        agent_id = normalize_agent_id(payload.get("agent_id") or self.default_agent_id)
+        if not self.agent_mgr.get_agent(agent_id):
+            raise ValueError(f"agent '{agent_id}' not found")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        prompt = (
+            "Scheduled background task. Be concise and report only useful results.\n\n"
+            f"Job: {job.name} ({job.id})\n"
+            f"Current time: {now_str}\n\n"
+            f"{message}"
+        )
+        return run_async(run_agent(
+            self.agent_mgr,
+            agent_id,
+            self._session_key(job, agent_id),
+            prompt,
+            channel="cron",
+            llm_client=self.llm_client,
+        ))
+
+    def _run_job(self, job: CronJob, now: float) -> bool:
+        acquired = self.lane_lock.acquire(blocking=False)
+        if not acquired:
+            return False
+        self.running_job_id = job.id
+        output, status, error = "", "ok", ""
+        try:
+            payload = job.payload
+            kind = payload.get("kind", "")
+            if kind == "agent_turn":
+                output = self._run_agent_payload(job, payload)
+                if output == "[empty message]":
+                    status = "skipped"
+            elif kind == "system_event":
+                output = str(payload.get("text", "")).strip()
+                if not output:
+                    status = "skipped"
+            else:
+                output = f"[unknown cron payload kind: {kind}]"
+                status = "error"
+                error = f"unknown payload kind: {kind}"
+        except Exception as exc:
+            status = "error"
+            error = str(exc)
+            output = f"[cron error: {exc}]"
+        finally:
+            self.running_job_id = None
+            self.lane_lock.release()
+
+        job.last_run_at = now
+        if status == "error":
+            job.consecutive_errors += 1
+            if job.consecutive_errors >= CRON_AUTO_DISABLE_THRESHOLD:
+                job.enabled = False
+                self._queue_output(
+                    f"Job '{job.name}' auto-disabled after {job.consecutive_errors} consecutive errors: {error}"
+                )
+        else:
+            job.consecutive_errors = 0
+        job.next_run_at = self._compute_next(job, now)
+        self._append_log(job, now, status, output, error)
+        if output and status != "skipped":
+            self._queue_output(f"[{job.name}] {output}")
+        return True
+
+    def _append_log(self, job: CronJob, run_at: float, status: str, output: str, error: str = "") -> None:
+        entry = {
+            "job_id": job.id,
+            "job_name": job.name,
+            "run_at": datetime.fromtimestamp(run_at, tz=timezone.utc).isoformat(),
+            "status": status,
+            "output_preview": output[:200],
+        }
+        if error:
+            entry["error"] = error
+        try:
+            with self._run_log.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def trigger_job(self, job_id: str) -> str:
+        target = job_id.strip()
+        for job in self.jobs:
+            if job.id == target:
+                ran = self._run_job(job, time.time())
+                if not ran:
+                    return "main lane occupied, cannot trigger"
+                return f"'{job.name}' triggered (errors={job.consecutive_errors})"
+        return f"Job '{target}' not found"
+
+    def drain_output(self) -> list[str]:
+        with self._queue_lock:
+            items = list(self._output_queue)
+            self._output_queue.clear()
+            return items
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        now = time.time()
+        result: list[dict[str, Any]] = []
+        for job in self.jobs:
+            next_in = max(0.0, job.next_run_at - now) if job.next_run_at > 0 else None
+            result.append({
+                "id": job.id,
+                "name": job.name,
+                "enabled": job.enabled,
+                "kind": job.schedule_kind,
+                "errors": job.consecutive_errors,
+                "last_run": datetime.fromtimestamp(job.last_run_at).isoformat() if job.last_run_at > 0 else "never",
+                "next_run": datetime.fromtimestamp(job.next_run_at).isoformat() if job.next_run_at > 0 else "n/a",
+                "next_in": round(next_in) if next_in is not None else None,
+            })
+        return result
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "cron_file": str(self.cron_file),
+            "jobs": len(self.jobs),
+            "running_job_id": self.running_job_id or "",
+            "croniter": HAS_CRONITER,
+            "log": str(self._run_log),
+        }
+
 _event_loop: asyncio.AbstractEventLoop | None = None
 _loop_thread: threading.Thread | None = None
 
@@ -2087,6 +2720,7 @@ async def run_agent(mgr: AgentManager, agent_id: str, session_key: str,
         try:
             return await _agent_loop(llm_client, agent.effective_model, system_prompt, messages)
         finally:
+            mgr.save_session(session_key)
             if on_typing:
                 on_typing(agent_id, False)
 
@@ -2328,6 +2962,10 @@ def handle_repl_command(
         set_force_agent: Optional[Callable[..., Any]] = None,
         gw_server: Optional["GatewayServer"] = None,
         set_gw_server: Optional[Callable[..., Any]] = None,
+        heartbeat: Optional[HeartbeatRunner] = None,
+        cron_svc: Optional[CronService] = None,
+        lane_lock: Optional[threading.Lock] = None,
+        active_session_key: str = "",
         bootstrap_data: dict[str, str] | None = None,
         skills_mgr: SkillsManager | None = None,
         skills_block: str = "",
@@ -2338,7 +2976,9 @@ def handle_repl_command(
 
     if cmd == "/new":
         label = arg or ""
-        sid = store.create_session(label)
+        sid = active_session_key or store.create_session(label)
+        if active_session_key:
+            store.save_session(active_session_key, [], label=label or "cli")
         print_session(f"Created new session: {sid}" + (f" ({label})" if label else ""))
         return True, [], force_agent_id, gw_server
     elif cmd == "/list":
@@ -2495,6 +3135,78 @@ def handle_repl_command(
         )
         return True, messages, force_agent_id, gw_server
 
+    elif cmd == "/heartbeat":
+        if heartbeat is None:
+            print_warn("Heartbeat not available")
+            return True, messages, force_agent_id, gw_server
+        for key, value in heartbeat.status().items():
+            print_info(f"  {key}: {value}")
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/trigger":
+        if heartbeat is None:
+            print_warn("Heartbeat not available")
+            return True, messages, force_agent_id, gw_server
+        print_info(f"  {heartbeat.trigger()}")
+        for item in heartbeat.drain_output():
+            print_heartbeat(item)
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/cron":
+        if cron_svc is None:
+            print_warn("Cron not available")
+            return True, messages, force_agent_id, gw_server
+        status = cron_svc.status()
+        print_info(f"  CRON.json: {status['cron_file']}")
+        print_info(f"  croniter: {'yes' if status['croniter'] else 'no (using built-in 5-field fallback)'}")
+        if status["running_job_id"]:
+            print_info(f"  running: {status['running_job_id']}")
+        jobs = cron_svc.list_jobs()
+        if not jobs:
+            print_info("  No cron jobs.")
+        for job in jobs:
+            tag = f"{GREEN}ON{RESET}" if job["enabled"] else f"{RED}OFF{RESET}"
+            err = f" {YELLOW}err:{job['errors']}{RESET}" if job["errors"] else ""
+            nxt = f" in {job['next_in']}s" if job["next_in"] is not None else " unscheduled"
+            print(f"  [{tag}] {job['id']} - {job['name']} ({job['kind']}){err}{nxt}")
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/cron-trigger":
+        if cron_svc is None:
+            print_warn("Cron not available")
+            return True, messages, force_agent_id, gw_server
+        if not arg:
+            print_warn("Usage: /cron-trigger <job_id>")
+            return True, messages, force_agent_id, gw_server
+        print_info(f"  {cron_svc.trigger_job(arg)}")
+        for item in cron_svc.drain_output():
+            print_cron(item)
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/cron-reload":
+        if cron_svc is None:
+            print_warn("Cron not available")
+            return True, messages, force_agent_id, gw_server
+        print_info(f"  {cron_svc.reload()}")
+        for item in cron_svc.drain_output():
+            print_cron(item)
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/lanes":
+        if lane_lock is None:
+            print_warn("Lane lock not available")
+            return True, messages, force_agent_id, gw_server
+        locked = not lane_lock.acquire(blocking=False)
+        if not locked:
+            lane_lock.release()
+        cron_running = cron_svc.running_job_id if cron_svc else ""
+        print_info(
+            f"  main_locked: {locked}  "
+            f"heartbeat_running: {heartbeat.running if heartbeat else False}  "
+            f"cron_running: {cron_running or False}"
+        )
+        return True, messages, force_agent_id, gw_server
+
     elif cmd == "/accounts":
         accounts = mgr.accounts
         if accounts:
@@ -2639,6 +3351,12 @@ def handle_repl_command(
         print_info("    /prompt            Preview composed system prompt")
         print_info("    /bootstrap         Show loaded bootstrap files")
         print_info("    /reload_intelligence Reload bootstrap files and skills")
+        print_info("    /heartbeat         Show heartbeat status")
+        print_info("    /trigger           Force heartbeat now")
+        print_info("    /cron              List cron jobs")
+        print_info("    /cron-trigger <id> Trigger a cron job")
+        print_info("    /cron-reload       Reload CRON.json")
+        print_info("    /lanes             Show lane lock status")
         print_info("")
         print_info("  Gateway Commands:")
         print_info("    /bindings          List all route bindings")
@@ -2685,6 +3403,8 @@ def run_agent_turn(
     messages = conversations[sk]
 
     should_persisit = (store is not None and inbound.channel == "cli")
+    if should_persisit:
+        store.ensure_session(sk, label=inbound.channel)
 
     # --- 添加聊天记录到历史 ---
     user_message = {
@@ -2694,7 +3414,7 @@ def run_agent_turn(
     messages.append(user_message)
     if should_persisit:
         user_record = user_message.copy()
-        store.append_transcript(store.current_session_id, user_record)
+        store.append_transcript(sk, user_record)
 
     guard = ContextGuard()
 
@@ -2743,7 +3463,7 @@ def run_agent_turn(
 
         messages.append(assistant_msg)
         if should_persisit:
-            store.append_transcript(store.current_session_id, assistant_msg.copy())
+            store.append_transcript(sk, assistant_msg.copy())
 
         # --- 调用终止条件stop_reason ---
         if finish_reason == "stop":
@@ -2776,7 +3496,7 @@ def run_agent_turn(
                 }
                 messages.append(tool_msg)
                 if should_persisit:
-                    store.append_transcript(store.current_session_id, tool_msg.copy())
+                    store.append_transcript(sk, tool_msg.copy())
             else:
                 for tc in tool_calls:
                     tool_name = tc["function"]["name"]
@@ -2792,7 +3512,7 @@ def run_agent_turn(
                     messages.append(tool_msg)
 
                     if should_persisit:
-                        store.append_transcript(store.current_session_id, tool_msg.copy())
+                        store.append_transcript(sk, tool_msg.copy())
             continue
 
         else:
@@ -2818,7 +3538,8 @@ def agent_loop() -> None:
 
     mgr = ChannelManager()
     bindings = BindingTable()
-    agent_mgr = AgentManager()
+    store = SessionStore()
+    agent_mgr = AgentManager(session_store=store)
 
     refresh_intelligence()
     setup_default_agent(agent_mgr, bindings)
@@ -2844,8 +3565,8 @@ def agent_loop() -> None:
         mgr.register(FeishuChannel(fs_acc))
         print_channel("[+] Feishu channel registered (requires webhook server)")
 
-    store = SessionStore(agent_id="MyClaw")
     guard = ContextGuard()
+    lane_lock = threading.Lock()
 
     conversations: dict[str, list[dict]] = {}
 
@@ -2857,22 +3578,49 @@ def agent_loop() -> None:
         peer_id="cli-user",
         dm_scope=cli_agent.dm_scope if cli_agent else "per-peer",
     )
-    sessions = store.list_sessions()
-    if sessions:
-        sid = sessions[0][0]
-        cli_history = store.load_session(sid)
+    cli_history = store.load_session(cli_sk)
+    if cli_history:
         conversations[cli_sk] = cli_history
-        print_session(f"Resumed session: {sid} ({len(cli_history)} messages)")
+        print_session(f"Resumed session: {cli_sk} ({len(cli_history)} messages)")
     else:
-        sid = store.create_session("initial")
+        store.ensure_session(cli_sk, label="cli")
         conversations[cli_sk] = []
-        print_session(f"Created initial session: {sid}")
+        print_session(f"Created initial session: {cli_sk}")
 
     msg_queue: queue.Queue[InboundMessage | None] = queue.Queue()
     stop_event = threading.Event()
 
     force_agent_id: str | None = None
     gw_server: GatewayServer | None = None
+    heartbeat = HeartbeatRunner(
+        workspace=WORKSPACE_DIR,
+        lane_lock=lane_lock,
+        agent_mgr=agent_mgr,
+        llm_client=llm_client,
+        interval=float(os.getenv("HEARTBEAT_INTERVAL", "1800")),
+        active_hours=(
+            int(os.getenv("HEARTBEAT_ACTIVE_START", "9")),
+            int(os.getenv("HEARTBEAT_ACTIVE_END", "22")),
+        ),
+        agent_id=DEFAULT_AGENT_ID,
+    )
+    heartbeat.start()
+    cron_svc = CronService(
+        WORKSPACE_DIR / "CRON.json",
+        lane_lock=lane_lock,
+        agent_mgr=agent_mgr,
+        llm_client=llm_client,
+        default_agent_id=DEFAULT_AGENT_ID,
+    )
+    cron_stop = threading.Event()
+
+    def cron_loop() -> None:
+        while not cron_stop.is_set():
+            try:
+                cron_svc.tick()
+            except Exception:
+                pass
+            cron_stop.wait(timeout=1.0)
 
     def set_force_agent(aid: str | None) -> None:
         nonlocal force_agent_id
@@ -2899,6 +3647,8 @@ def agent_loop() -> None:
     print_info(f" Intelligence workspace: {WORKSPACE_DIR}")
     print_info(f" Bootstrap files: {len(BOOTSTRAP_DATA)}")
     print_info(f" Skills: {len(SKILLS_MANAGER.skills)}")
+    print_info(f" Heartbeat: {'on' if heartbeat.heartbeat_path.exists() else 'off'} ({heartbeat.interval}s)")
+    print_info(f" Cron jobs: {len(cron_svc.jobs)}")
     print_info(f" Workdir: {WORKDIR}")
     print_info(f" Tools: {', '.join(TOOL_HANDLERS.keys())}")
     print_info("  输入 /help 获取指令提示, 输入 'quit' 或 'exit' 退出.")
@@ -2907,9 +3657,15 @@ def agent_loop() -> None:
 
     cli_thread = threading.Thread(target=cli_reader, daemon=True)
     cli_thread.start()
+    cron_thread = threading.Thread(target=cron_loop, daemon=True, name="cron-tick")
+    cron_thread.start()
 
     try:
         while not stop_event.is_set():
+            for item in heartbeat.drain_output():
+                print_heartbeat(item)
+            for item in cron_svc.drain_output():
+                print_cron(item)
             try:
                 msg = msg_queue.get(timeout=0.5)
             except queue.Empty:
@@ -2933,6 +3689,10 @@ def agent_loop() -> None:
                         set_force_agent=set_force_agent,
                         gw_server=gw_server,
                         set_gw_server=set_gw_server,
+                        heartbeat=heartbeat,
+                        cron_svc=cron_svc,
+                        lane_lock=lane_lock,
+                        active_session_key=cli_sk,
                         bootstrap_data=BOOTSTRAP_DATA,
                         skills_mgr=SKILLS_MANAGER,
                         skills_block=SKILLS_BLOCK,
@@ -2953,11 +3713,15 @@ def agent_loop() -> None:
                     if a:
                         sk = build_session_key(aid, channel=msg.channel, account_id=msg.account_id,
                                                peer_id=msg.peer_id, dm_scope=a.dm_scope)
-                        result = run_async(run_agent(
-                            agent_mgr, aid, sk, msg.text,
-                            channel=msg.channel,
-                            llm_client=llm_client,
-                        ))
+                        lane_lock.acquire()
+                        try:
+                            result = run_async(run_agent(
+                                agent_mgr, aid, sk, msg.text,
+                                channel=msg.channel,
+                                llm_client=llm_client,
+                            ))
+                        finally:
+                            lane_lock.release()
                         print_assistant(result)
                     else:
                         print_warn(f"Agent '{aid}' not found")
@@ -2969,16 +3733,20 @@ def agent_loop() -> None:
                         channel=msg.channel,
                         memory_context=memory_context,
                     )
-                    run_agent_turn(
-                        msg,
-                        conversations,
-                        mgr,
-                        llm_client,
-                        store=store,
-                        model_id=cli_agent.effective_model if cli_agent else MODEL_ID,
-                        system_prompt=system_prompt,
-                        session_key=cli_sk,
-                    )
+                    lane_lock.acquire()
+                    try:
+                        run_agent_turn(
+                            msg,
+                            conversations,
+                            mgr,
+                            llm_client,
+                            store=store,
+                            model_id=cli_agent.effective_model if cli_agent else MODEL_ID,
+                            system_prompt=system_prompt,
+                            session_key=cli_sk,
+                        )
+                    finally:
+                        lane_lock.release()
                 cli.allow_input()
             else:
                 if force_agent_id:
@@ -2987,11 +3755,15 @@ def agent_loop() -> None:
                     if a:
                         sk = build_session_key(aid, channel=msg.channel, account_id=msg.account_id,
                                                peer_id=msg.peer_id, dm_scope=a.dm_scope)
-                        result = run_async(run_agent(
-                            agent_mgr, aid, sk, msg.text,
-                            channel=msg.channel,
-                            llm_client=llm_client,
-                        ))
+                        lane_lock.acquire()
+                        try:
+                            result = run_async(run_agent(
+                                agent_mgr, aid, sk, msg.text,
+                                channel=msg.channel,
+                                llm_client=llm_client,
+                            ))
+                        finally:
+                            lane_lock.release()
                         ch = mgr.get(msg.channel)
                         if ch:
                             ch.send(msg.peer_id, result)
@@ -3000,11 +3772,15 @@ def agent_loop() -> None:
                 else:
                     aid, sk = resolve_route(bindings, agent_mgr, channel=msg.channel,
                                             account_id=msg.account_id, peer_id=msg.peer_id)
-                    result = run_async(run_agent(
-                        agent_mgr, aid, sk, msg.text,
-                        channel=msg.channel,
-                        llm_client=llm_client,
-                    ))
+                    lane_lock.acquire()
+                    try:
+                        result = run_async(run_agent(
+                            agent_mgr, aid, sk, msg.text,
+                            channel=msg.channel,
+                            llm_client=llm_client,
+                        ))
+                    finally:
+                        lane_lock.release()
                     ch = mgr.get(msg.channel)
                     if ch:
                         ch.send(msg.peer_id, result)
@@ -3015,7 +3791,10 @@ def agent_loop() -> None:
         print()
     finally:
         stop_event.set()
+        cron_stop.set()
         cli_thread.join(timeout=2.0)
+        cron_thread.join(timeout=2.0)
+        heartbeat.stop()
         if gw_server:
             run_async(gw_server.stop())
         mgr.close_all()

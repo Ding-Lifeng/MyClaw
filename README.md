@@ -19,6 +19,8 @@ Multi-provider(OpenAI, Anthropic, DashScope) ✔
 
 Soul/Skill/Memory ✔
 
+Heartbeat/Cron ✔
+
 
 
 # Todo：

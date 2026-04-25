@@ -8,6 +8,7 @@ import dashscope
 from datetime import datetime, timezone, timedelta
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 
 try:
     import httpx
@@ -1711,6 +1712,213 @@ class LLMClient(ABC):
              ) -> dict:
         pass
 
+class FailoverReason(Enum):
+    rate_limit = "rate_limit"
+    auth = "auth"
+    timeout = "timeout"
+    billing = "billing"
+    overflow = "overflow"
+    network = "network"
+    server = "server"
+    unknown = "unknown"
+
+def classify_failure(exc: Exception) -> FailoverReason:
+    msg = str(exc).lower()
+    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+        return FailoverReason.rate_limit
+    if "401" in msg or "403" in msg or "auth" in msg or "api key" in msg or "invalid key" in msg:
+        return FailoverReason.auth
+    if "402" in msg or "billing" in msg or "quota" in msg or "insufficient" in msg:
+        return FailoverReason.billing
+    if "context" in msg or "token" in msg or "maximum context" in msg or "too long" in msg:
+        return FailoverReason.overflow
+    if "timeout" in msg or "timed out" in msg:
+        return FailoverReason.timeout
+    if "connection" in msg or "network" in msg or "dns" in msg or "tls" in msg:
+        return FailoverReason.network
+    if "500" in msg or "502" in msg or "503" in msg or "504" in msg or "server" in msg:
+        return FailoverReason.server
+    return FailoverReason.unknown
+
+@dataclass
+class ResilienceState:
+    provider: str
+    model: str
+    consecutive_failures: int = 0
+    cooldown_until: float = 0.0
+    last_failure_reason: str = ""
+    last_error: str = ""
+    last_failure_at: float = 0.0
+    last_success_at: float = 0.0
+    total_attempts: int = 0
+    total_successes: int = 0
+    total_failures: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "consecutive_failures": self.consecutive_failures,
+            "cooldown_until": self.cooldown_until,
+            "last_failure_reason": self.last_failure_reason,
+            "last_error": self.last_error,
+            "last_failure_at": self.last_failure_at,
+            "last_success_at": self.last_success_at,
+            "total_attempts": self.total_attempts,
+            "total_successes": self.total_successes,
+            "total_failures": self.total_failures,
+        }
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "ResilienceState":
+        return ResilienceState(
+            provider=str(data.get("provider", "")),
+            model=str(data.get("model", "")),
+            consecutive_failures=int(data.get("consecutive_failures", 0)),
+            cooldown_until=float(data.get("cooldown_until", 0.0)),
+            last_failure_reason=str(data.get("last_failure_reason", "")),
+            last_error=str(data.get("last_error", "")),
+            last_failure_at=float(data.get("last_failure_at", 0.0)),
+            last_success_at=float(data.get("last_success_at", 0.0)),
+            total_attempts=int(data.get("total_attempts", 0)),
+            total_successes=int(data.get("total_successes", 0)),
+            total_failures=int(data.get("total_failures", 0)),
+        )
+
+class ResilienceManager:
+    def __init__(
+            self,
+            state_path: Path,
+            max_retries: int = 3,
+            circuit_threshold: int = 5,
+            circuit_cooldown: float = 300.0,
+    ) -> None:
+        self.state_path = state_path
+        self.max_retries = max_retries
+        self.circuit_threshold = circuit_threshold
+        self.circuit_cooldown = circuit_cooldown
+        self._lock = threading.Lock()
+        self._states: dict[str, ResilienceState] = {}
+        self._load()
+
+    def _key(self, provider: str, model: str) -> str:
+        return f"{provider}:{model}"
+
+    def _load(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self._states = {
+                key: ResilienceState.from_dict(value)
+                for key, value in raw.get("states", {}).items()
+                if isinstance(value, dict)
+            }
+        except (json.JSONDecodeError, OSError):
+            self._states = {}
+
+    def _save(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"states": {key: state.to_dict() for key, state in self._states.items()}}
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            os.replace(str(tmp), str(self.state_path))
+        except OSError:
+            self.state_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def get_state(self, provider: str, model: str) -> ResilienceState:
+        key = self._key(provider, model)
+        with self._lock:
+            if key not in self._states:
+                self._states[key] = ResilienceState(provider=provider, model=model)
+            return self._states[key]
+
+    def _cooldown_for(self, reason: FailoverReason, failures: int) -> float:
+        if reason == FailoverReason.auth:
+            return self.circuit_cooldown
+        if reason == FailoverReason.billing:
+            return self.circuit_cooldown * 2
+        if reason == FailoverReason.rate_limit:
+            return min(600.0, 30.0 * max(1, failures))
+        if reason in (FailoverReason.timeout, FailoverReason.network, FailoverReason.server):
+            return min(180.0, 10.0 * max(1, failures))
+        if reason == FailoverReason.overflow:
+            return 0.0
+        return min(120.0, 10.0 * max(1, failures))
+
+    def _retry_delay(self, attempt: int, reason: FailoverReason) -> float:
+        if reason in (FailoverReason.auth, FailoverReason.billing, FailoverReason.overflow):
+            return 0.0
+        base = min(8.0, 0.75 * (2 ** max(0, attempt - 1)))
+        return base + random.uniform(0.0, base * 0.25)
+
+    def run_chat(
+            self,
+            client: LLMClient,
+            provider: str,
+            model: str,
+            **kwargs: Any,
+    ) -> dict:
+        state = self.get_state(provider, model)
+        now = time.time()
+        if state.cooldown_until > now:
+            remaining = round(state.cooldown_until - now)
+            raise RuntimeError(
+                f"Resilience circuit open for {provider}:{model}; "
+                f"retry in {remaining}s (reason={state.last_failure_reason})"
+            )
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            with self._lock:
+                state.total_attempts += 1
+                self._save()
+            try:
+                response = client.chat(model=model, **kwargs)
+                with self._lock:
+                    state.consecutive_failures = 0
+                    state.cooldown_until = 0.0
+                    state.last_failure_reason = ""
+                    state.last_error = ""
+                    state.last_success_at = time.time()
+                    state.total_successes += 1
+                    self._save()
+                return response
+            except Exception as exc:
+                last_exc = exc
+                reason = classify_failure(exc)
+                with self._lock:
+                    state.consecutive_failures += 1
+                    state.total_failures += 1
+                    state.last_failure_reason = reason.value
+                    state.last_error = str(exc)[:500]
+                    state.last_failure_at = time.time()
+                    cooldown = self._cooldown_for(reason, state.consecutive_failures)
+                    if state.consecutive_failures >= self.circuit_threshold:
+                        cooldown = max(cooldown, self.circuit_cooldown)
+                    if cooldown > 0:
+                        state.cooldown_until = max(state.cooldown_until, time.time() + cooldown)
+                    self._save()
+                if reason in (FailoverReason.auth, FailoverReason.billing, FailoverReason.overflow):
+                    break
+                if attempt < self.max_retries:
+                    time.sleep(self._retry_delay(attempt, reason))
+        raise last_exc or RuntimeError("resilience run failed without exception")
+
+    def status(self) -> list[dict[str, Any]]:
+        now = time.time()
+        with self._lock:
+            rows = []
+            for state in self._states.values():
+                cooldown_remaining = max(0.0, state.cooldown_until - now)
+                rows.append({
+                    **state.to_dict(),
+                    "cooldown_remaining": round(cooldown_remaining),
+                    "available": cooldown_remaining <= 0,
+                })
+            return rows
+
 # Anthropic Adapter
 try:
     from anthropic import Anthropic
@@ -1905,6 +2113,37 @@ class DashScopeClient(LLMClient):
         }
 
 # LLM 工厂
+class ResilientLLMClient(LLMClient):
+    def __init__(self, inner: LLMClient, provider: str, resilience: ResilienceManager) -> None:
+        self.inner = inner
+        self.provider = provider
+        self.resilience = resilience
+
+    def chat(
+            self,
+            model: str,
+            system: str,
+            messages: list[dict],
+            max_tokens: int = 8096,
+            tools: list[dict] | None = None,
+    ) -> dict:
+        return self.resilience.run_chat(
+            self.inner,
+            provider=self.provider,
+            model=model,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
+
+RESILIENCE_MANAGER = ResilienceManager(
+    STATE_DIR / "resilience.json",
+    max_retries=int(os.getenv("RESILIENCE_MAX_RETRIES", "3")),
+    circuit_threshold=int(os.getenv("RESILIENCE_CIRCUIT_THRESHOLD", "5")),
+    circuit_cooldown=float(os.getenv("RESILIENCE_CIRCUIT_COOLDOWN", "300")),
+)
+
 def create_llm_client() -> LLMClient:
     provider = LLM_PROVIDER
     if not provider:
@@ -1920,15 +2159,27 @@ def create_llm_client() -> LLMClient:
     if provider == "anthropic":
         if not ANTHROPIC_API_KEY:
             raise RuntimeError("ANTHROPIC_API_KEY is required for Anthropic provider.")
-        return AnthropicClient(ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL)
+        return ResilientLLMClient(
+            AnthropicClient(ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL),
+            provider,
+            RESILIENCE_MANAGER,
+        )
     elif provider == "openai":
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI provider.")
-        return OpenAIClient(OPENAI_API_KEY, OPENAI_BASE_URL)
+        return ResilientLLMClient(
+            OpenAIClient(OPENAI_API_KEY, OPENAI_BASE_URL),
+            provider,
+            RESILIENCE_MANAGER,
+        )
     elif provider == "dashscope":
         if not DASHSCOPE_API_KEY:
             raise RuntimeError("DASHSCOPE_API_KEY is required for DashScope provider.")
-        return DashScopeClient(DASHSCOPE_API_KEY)
+        return ResilientLLMClient(
+            DashScopeClient(DASHSCOPE_API_KEY),
+            provider,
+            RESILIENCE_MANAGER,
+        )
     else:
         raise RuntimeError(f"Unknown LLM provider: {provider}")
 
@@ -3654,6 +3905,28 @@ def handle_repl_command(
         print_info("  Use /inbox clear to clear these items.")
         return True, messages, force_agent_id, gw_server
 
+    elif cmd == "/resilience":
+        rows = RESILIENCE_MANAGER.status()
+        if not rows:
+            print_info("  No resilience state recorded yet.")
+            return True, messages, force_agent_id, gw_server
+        print_section("Resilience")
+        for row in rows:
+            status = "available" if row["available"] else f"cooldown {row['cooldown_remaining']}s"
+            last_success = (
+                datetime.fromtimestamp(row["last_success_at"]).isoformat()
+                if row["last_success_at"] else "never"
+            )
+            print_info(
+                f"  {row['provider']}:{row['model']} {status} "
+                f"failures={row['consecutive_failures']} "
+                f"success={row['total_successes']}/{row['total_attempts']} "
+                f"last_success={last_success}"
+            )
+            if row.get("last_failure_reason"):
+                print_info(f"    last_failure={row['last_failure_reason']} {row.get('last_error', '')[:120]}")
+        return True, messages, force_agent_id, gw_server
+
     elif cmd == "/lanes":
         if lane_lock is None:
             print_warn("Lane lock not available")
@@ -3824,6 +4097,7 @@ def handle_repl_command(
         print_info("    /retry-failed      Retry failed deliveries")
         print_info("    /inbox             Show heartbeat/cron/delivery background output")
         print_info("    /inbox clear       Clear background inbox")
+        print_info("    /resilience        Show LLM retry/circuit state")
         print_info("    /lanes             Show lane lock status")
         print_info("")
         print_info("  Gateway Commands:")

@@ -1,5 +1,5 @@
 # DClaw
-Based on the implementations of Claw0, NanoBot, and OpenClaw, develop a lightweight Agent.
+Based on the implementations of claw0, learn-claude-code, NanoBot and OpenClaw, develop a lightweight Agent.
 
 
 
@@ -27,6 +27,8 @@ Heartbeat/Cron ✔
 
 Reliable Message Delivery ✔
 
+Resilient retry ✔
+
 
 
 # Todo：
@@ -38,3 +40,5 @@ Refine Workspace
 Refine Skills Management
 
 Refine Memory Search and Memory Management
+
+Test on wechat and feishu

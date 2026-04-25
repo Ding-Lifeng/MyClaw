@@ -1,6 +1,7 @@
 import os, sys, subprocess, json, uuid, time, asyncio, hashlib, random
 import math, queue, threading, re
-from collections import OrderedDict
+import concurrent.futures
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any, Callable, Optional
 from dotenv import load_dotenv
@@ -79,6 +80,12 @@ LOCAL_EMBED_PATH_WEIGHT = 1.2
 LOCAL_EMBED_PATH_PART_WEIGHT = 1.0
 LOCAL_EMBED_CATEGORY_WEIGHT = 1.2
 LOCAL_EMBED_CACHE_MAX = 512
+
+LANE_MAIN = "main"
+LANE_HEARTBEAT = "heartbeat"
+LANE_CRON = "cron"
+LANE_DELIVERY = "delivery"
+DEFAULT_LANE_MAX_CONCURRENCY = 1
 
 # 输出字符限制
 MAX_TOOL_OUTPUT = 50000
@@ -888,41 +895,49 @@ class AgentManager:
         self._agents_base = agents_base or AGENTS_DIR
         self._sessions: dict[str, list[dict]] = {}
         self._session_store = session_store
+        self._lock = threading.RLock()
 
     def set_session_store(self, session_store: Any) -> None:
-        self._session_store = session_store
+        with self._lock:
+            self._session_store = session_store
 
     def register(self, config: AgentConfig) -> None:
         aid = normalize_agent_id(config.id)
         config.id = aid
-        self._agents[aid] = config
+        with self._lock:
+            self._agents[aid] = config
         agent_dir = self._agents_base / aid
         (agent_dir / "sessions").mkdir(parents=True, exist_ok=True)
         (WORKDIR / f"workspace-{aid}").mkdir(parents=True, exist_ok=True)
 
     def get_agent(self, agent_id: str) -> AgentConfig | None:
-        return self._agents.get(normalize_agent_id(agent_id))
+        with self._lock:
+            return self._agents.get(normalize_agent_id(agent_id))
 
     def list_agents(self) -> list[AgentConfig]:
-        return list(self._agents.values())
+        with self._lock:
+            return list(self._agents.values())
 
     def get_session(self, session_key: str) -> list[dict]:
-        if session_key not in self._sessions:
-            if self._session_store is not None:
-                self._sessions[session_key] = self._session_store.load_session(session_key)
-                self._session_store.ensure_session(session_key)
-            else:
-                self._sessions[session_key] = []
-        return self._sessions[session_key]
+        with self._lock:
+            if session_key not in self._sessions:
+                if self._session_store is not None:
+                    self._sessions[session_key] = self._session_store.load_session(session_key)
+                    self._session_store.ensure_session(session_key)
+                else:
+                    self._sessions[session_key] = []
+            return self._sessions[session_key]
 
     def save_session(self, session_key: str) -> None:
-        if self._session_store is not None and session_key in self._sessions:
-            self._session_store.save_session(session_key, self._sessions[session_key])
+        with self._lock:
+            if self._session_store is not None and session_key in self._sessions:
+                self._session_store.save_session(session_key, self._sessions[session_key])
 
     def list_sessions(self, agent_id: str = "") -> dict[str, int]:
         aid = normalize_agent_id(agent_id) if agent_id else ""
-        return {k: len(v) for k, v in self._sessions.items()
-                if not aid or k.startswith(f"agent:{aid}:")}
+        with self._lock:
+            return {k: len(v) for k, v in self._sessions.items()
+                    if not aid or k.startswith(f"agent:{aid}:")}
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -2749,11 +2764,155 @@ def compose_runtime_system_prompt(
         channel=channel,
     )
 
+
+class LaneQueue:
+    """Named FIFO lane with bounded in-lane concurrency."""
+
+    def __init__(self, name: str, max_concurrency: int = DEFAULT_LANE_MAX_CONCURRENCY) -> None:
+        self.name = name
+        self.max_concurrency = max(1, max_concurrency)
+        self._deque: deque[tuple[Callable[[], Any], concurrent.futures.Future, int]] = deque()
+        self._condition = threading.Condition()
+        self._active_count = 0
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        with self._condition:
+            return self._generation
+
+    def enqueue(
+            self,
+            fn: Callable[[], Any],
+            generation: int | None = None,
+    ) -> concurrent.futures.Future:
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        with self._condition:
+            gen = self._generation if generation is None else generation
+            self._deque.append((fn, future, gen))
+            self._pump()
+        return future
+
+    def set_max_concurrency(self, value: int) -> None:
+        with self._condition:
+            self.max_concurrency = max(1, int(value))
+            self._pump()
+            self._condition.notify_all()
+
+    def reset_generation(self) -> int:
+        with self._condition:
+            self._generation += 1
+            self._condition.notify_all()
+            return self._generation
+
+    def _pump(self) -> None:
+        while self._active_count < self.max_concurrency and self._deque:
+            fn, future, gen = self._deque.popleft()
+            if future.set_running_or_notify_cancel():
+                self._active_count += 1
+                thread = threading.Thread(
+                    target=self._run_task,
+                    args=(fn, future, gen),
+                    daemon=True,
+                    name=f"lane-{self.name}",
+                )
+                thread.start()
+
+    def _run_task(
+            self,
+            fn: Callable[[], Any],
+            future: concurrent.futures.Future,
+            generation: int,
+    ) -> None:
+        try:
+            future.set_result(fn())
+        except Exception as exc:
+            future.set_exception(exc)
+        finally:
+            self._task_done(generation)
+
+    def _task_done(self, generation: int) -> None:
+        with self._condition:
+            self._active_count = max(0, self._active_count - 1)
+            if generation == self._generation:
+                self._pump()
+            self._condition.notify_all()
+
+    def wait_for_idle(self, timeout: float | None = None) -> bool:
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        with self._condition:
+            while self._active_count > 0 or self._deque:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            return True
+
+    def stats(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "name": self.name,
+                "queue_depth": len(self._deque),
+                "active": self._active_count,
+                "max_concurrency": self.max_concurrency,
+                "generation": self._generation,
+            }
+
+
+class CommandQueue:
+    """Routes callable work into named lanes."""
+
+    def __init__(self) -> None:
+        self._lanes: dict[str, LaneQueue] = {}
+        self._lock = threading.Lock()
+
+    def get_or_create_lane(
+            self,
+            name: str,
+            max_concurrency: int = DEFAULT_LANE_MAX_CONCURRENCY,
+    ) -> LaneQueue:
+        lane_name = (name or "default").strip().lower()
+        with self._lock:
+            lane = self._lanes.get(lane_name)
+            if lane is None:
+                lane = LaneQueue(lane_name, max_concurrency=max_concurrency)
+                self._lanes[lane_name] = lane
+            return lane
+
+    def enqueue(self, lane_name: str, fn: Callable[[], Any]) -> concurrent.futures.Future:
+        return self.get_or_create_lane(lane_name).enqueue(fn)
+
+    def set_max_concurrency(self, lane_name: str, value: int) -> None:
+        self.get_or_create_lane(lane_name).set_max_concurrency(value)
+
+    def reset_all(self) -> dict[str, int]:
+        with self._lock:
+            lanes = list(self._lanes.items())
+        return {name: lane.reset_generation() for name, lane in lanes}
+
+    def wait_for_all(self, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._lock:
+            lanes = list(self._lanes.values())
+        for lane in lanes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not lane.wait_for_idle(timeout=remaining):
+                return False
+        return True
+
+    def stats(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {name: lane.stats() for name, lane in self._lanes.items()}
+
+    def lane_names(self) -> list[str]:
+        with self._lock:
+            return sorted(self._lanes)
+
 class HeartbeatRunner:
     def __init__(
             self,
             workspace: Path,
-            lane_lock: threading.Lock,
+            command_queue: CommandQueue,
             agent_mgr: AgentManager,
             llm_client: LLMClient,
             interval: float = 1800.0,
@@ -2762,7 +2921,7 @@ class HeartbeatRunner:
     ) -> None:
         self.workspace = workspace
         self.heartbeat_path = workspace / "HEARTBEAT.md"
-        self.lane_lock = lane_lock
+        self.command_queue = command_queue
         self.agent_mgr = agent_mgr
         self.llm_client = llm_client
         self.interval = interval
@@ -2804,6 +2963,9 @@ class HeartbeatRunner:
             return False, f"outside active hours ({start}:00-{end}:00)"
         if self.running:
             return False, "already running"
+        lane_stats = self.command_queue.get_or_create_lane(LANE_HEARTBEAT).stats()
+        if lane_stats["active"] > 0:
+            return False, "heartbeat lane busy"
         return True, "all checks passed"
 
     def _parse_response(self, response: str) -> str | None:
@@ -2828,10 +2990,7 @@ class HeartbeatRunner:
         with self._queue_lock:
             self._output_queue.append(text)
 
-    def _execute(self) -> None:
-        acquired = self.lane_lock.acquire(blocking=False)
-        if not acquired:
-            return
+    def _run_once(self) -> str | None:
         self.running = True
         try:
             response = run_async(run_agent(
@@ -2846,22 +3005,35 @@ class HeartbeatRunner:
             if meaningful is None:
                 return
             if meaningful == self._last_output:
-                return
+                return None
             self._last_output = meaningful
-            self._queue_output(meaningful)
+            return meaningful
         except Exception as exc:
-            self._queue_output(f"[heartbeat error: {exc}]")
+            return f"[heartbeat error: {exc}]"
         finally:
             self.running = False
             self.last_run_at = time.time()
-            self.lane_lock.release()
+
+    def _enqueue(self) -> concurrent.futures.Future:
+        future = self.command_queue.enqueue(LANE_HEARTBEAT, self._run_once)
+
+        def _on_done(done: concurrent.futures.Future) -> None:
+            try:
+                output = done.result()
+                if output:
+                    self._queue_output(output)
+            except Exception as exc:
+                self._queue_output(f"[heartbeat error: {exc}]")
+
+        future.add_done_callback(_on_done)
+        return future
 
     def _loop(self) -> None:
         while not self._stopped:
             try:
                 ok, _ = self.should_run()
                 if ok:
-                    self._execute()
+                    self._enqueue()
             except Exception:
                 pass
             time.sleep(1.0)
@@ -2886,37 +3058,20 @@ class HeartbeatRunner:
             return items
 
     def trigger(self) -> str:
-        acquired = self.lane_lock.acquire(blocking=False)
-        if not acquired:
-            return "main lane occupied, cannot trigger"
-        self.running = True
+        if not self.heartbeat_path.exists():
+            return "HEARTBEAT.md not found"
+        if not self.heartbeat_path.read_text(encoding="utf-8").strip():
+            return "HEARTBEAT.md is empty"
+        future = self._enqueue()
         try:
-            if not self.heartbeat_path.exists():
-                return "HEARTBEAT.md not found"
-            if not self.heartbeat_path.read_text(encoding="utf-8").strip():
-                return "HEARTBEAT.md is empty"
-            response = run_async(run_agent(
-                self.agent_mgr,
-                self.agent_id,
-                self._session_key(),
-                self._build_prompt(),
-                channel="heartbeat",
-                llm_client=self.llm_client,
-            ))
-            meaningful = self._parse_response(response)
-            if meaningful is None:
-                return "HEARTBEAT_OK (nothing to report)"
-            if meaningful == self._last_output:
-                return "duplicate content (skipped)"
-            self._last_output = meaningful
-            self._queue_output(meaningful)
-            return f"triggered, output queued ({len(meaningful)} chars)"
+            output = future.result(timeout=float(os.getenv("HEARTBEAT_TRIGGER_TIMEOUT", "120")))
+            if output is None:
+                return "HEARTBEAT_OK or duplicate content (nothing queued)"
+            return f"triggered, output queued ({len(output)} chars)"
+        except concurrent.futures.TimeoutError:
+            return "heartbeat queued; still running"
         except Exception as exc:
             return f"trigger failed: {exc}"
-        finally:
-            self.running = False
-            self.last_run_at = time.time()
-            self.lane_lock.release()
 
     def status(self) -> dict[str, Any]:
         now = time.time()
@@ -2958,13 +3113,13 @@ class CronService:
     def __init__(
             self,
             cron_file: Path,
-            lane_lock: threading.Lock,
+            command_queue: CommandQueue,
             agent_mgr: AgentManager,
             llm_client: LLMClient,
             default_agent_id: str = DEFAULT_AGENT_ID,
     ) -> None:
         self.cron_file = cron_file
-        self.lane_lock = lane_lock
+        self.command_queue = command_queue
         self.agent_mgr = agent_mgr
         self.llm_client = llm_client
         self.default_agent_id = normalize_agent_id(default_agent_id)
@@ -3176,48 +3331,60 @@ class CronService:
         ))
 
     def _run_job(self, job: CronJob, now: float) -> bool:
-        acquired = self.lane_lock.acquire(blocking=False)
-        if not acquired:
+        lane_stats = self.command_queue.get_or_create_lane(LANE_CRON).stats()
+        if lane_stats["active"] > 0:
             return False
-        self.running_job_id = job.id
-        output, status, error = "", "ok", ""
-        try:
-            payload = job.payload
-            kind = payload.get("kind", "")
-            if kind == "agent_turn":
-                output = self._run_agent_payload(job, payload)
-                if output == "[empty message]":
-                    status = "skipped"
-            elif kind == "system_event":
-                output = str(payload.get("text", "")).strip()
-                if not output:
-                    status = "skipped"
-            else:
-                output = f"[unknown cron payload kind: {kind}]"
-                status = "error"
-                error = f"unknown payload kind: {kind}"
-        except Exception as exc:
-            status = "error"
-            error = str(exc)
-            output = f"[cron error: {exc}]"
-        finally:
-            self.running_job_id = None
-            self.lane_lock.release()
 
-        job.last_run_at = now
-        if status == "error":
-            job.consecutive_errors += 1
-            if job.consecutive_errors >= CRON_AUTO_DISABLE_THRESHOLD:
-                job.enabled = False
-                self._queue_output(
-                    f"Job '{job.name}' auto-disabled after {job.consecutive_errors} consecutive errors: {error}"
-                )
-        else:
-            job.consecutive_errors = 0
         job.next_run_at = self._compute_next(job, now)
-        self._append_log(job, now, status, output, error)
-        if output and status != "skipped":
-            self._queue_output(f"[{job.name}] {output}")
+
+        def _do_job() -> tuple[str, str, str]:
+            self.running_job_id = job.id
+            output, status, error = "", "ok", ""
+            try:
+                payload = job.payload
+                kind = payload.get("kind", "")
+                if kind == "agent_turn":
+                    output = self._run_agent_payload(job, payload)
+                    if output == "[empty message]":
+                        status = "skipped"
+                elif kind == "system_event":
+                    output = str(payload.get("text", "")).strip()
+                    if not output:
+                        status = "skipped"
+                else:
+                    output = f"[unknown cron payload kind: {kind}]"
+                    status = "error"
+                    error = f"unknown payload kind: {kind}"
+            except Exception as exc:
+                status = "error"
+                error = str(exc)
+                output = f"[cron error: {exc}]"
+            finally:
+                self.running_job_id = None
+            return output, status, error
+
+        future = self.command_queue.enqueue(LANE_CRON, _do_job)
+
+        def _on_done(done: concurrent.futures.Future, target: CronJob = job, run_at: float = now) -> None:
+            try:
+                output, status, error = done.result()
+            except Exception as exc:
+                output, status, error = f"[cron error: {exc}]", "error", str(exc)
+            target.last_run_at = run_at
+            if status == "error":
+                target.consecutive_errors += 1
+                if target.consecutive_errors >= CRON_AUTO_DISABLE_THRESHOLD:
+                    target.enabled = False
+                    self._queue_output(
+                        f"Job '{target.name}' auto-disabled after {target.consecutive_errors} consecutive errors: {error}"
+                    )
+            else:
+                target.consecutive_errors = 0
+            self._append_log(target, run_at, status, output, error)
+            if output and status != "skipped":
+                self._queue_output(f"[{target.name}] {output}")
+
+        future.add_done_callback(_on_done)
         return True
 
     def _append_log(self, job: CronJob, run_at: float, status: str, output: str, error: str = "") -> None:
@@ -3431,10 +3598,13 @@ async def _agent_loop(client: LLMClient, model: str, system: str, messages: list
 class GatewayServer:
     def __init__(self, mgr: AgentManager, bindings: BindingTable,
                  llm_client: LLMClient | None = None,
+                 command_queue: CommandQueue | None = None,
                  host: str = "localhost", port: int = 8765) -> None:
         self._mgr = mgr
         self._bindings = bindings
         self._llm_client = llm_client or create_llm_client()
+        self._command_queue = command_queue or CommandQueue()
+        self._command_queue.get_or_create_lane(LANE_MAIN, max_concurrency=1)
         self._host, self._port = host, port
         self._clients: set[Any] = set()
         self._start_time = time.monotonic()
@@ -3519,15 +3689,19 @@ class GatewayServer:
                 account_id=acc,
                 guild_id=gid,
             )
-        reply = await run_agent(
-            self._mgr,
-            aid,
-            sk,
-            text,
-            on_typing=self._typing_cb,
-            channel=ch,
-            llm_client=self._llm_client,
+        future = self._command_queue.enqueue(
+            LANE_MAIN,
+            lambda: run_async(run_agent(
+                self._mgr,
+                aid,
+                sk,
+                text,
+                on_typing=self._typing_cb,
+                channel=ch,
+                llm_client=self._llm_client,
+            )),
         )
+        reply = await asyncio.to_thread(future.result)
         return {"agent_id": aid, "session_key": sk, "reply": reply}
 
     async def _m_bind_set(self, p: dict) -> dict:
@@ -3598,7 +3772,7 @@ def handle_repl_command(
         delivery_queue: Optional[DeliveryQueue] = None,
         delivery_runner: Optional[DeliveryRunner] = None,
         inbox: Optional[BackgroundInbox] = None,
-        lane_lock: Optional[threading.Lock] = None,
+        command_queue: Optional[CommandQueue] = None,
         active_session_key: str = "",
         bootstrap_data: dict[str, str] | None = None,
         skills_mgr: SkillsManager | None = None,
@@ -3928,18 +4102,70 @@ def handle_repl_command(
         return True, messages, force_agent_id, gw_server
 
     elif cmd == "/lanes":
-        if lane_lock is None:
-            print_warn("Lane lock not available")
+        if command_queue is None:
+            print_warn("Command queue not available")
             return True, messages, force_agent_id, gw_server
-        locked = not lane_lock.acquire(blocking=False)
-        if not locked:
-            lane_lock.release()
-        cron_running = cron_svc.running_job_id if cron_svc else ""
-        print_info(
-            f"  main_locked: {locked}  "
-            f"heartbeat_running: {heartbeat.running if heartbeat else False}  "
-            f"cron_running: {cron_running or False}"
-        )
+        stats = command_queue.stats()
+        if not stats:
+            print_info("  No lanes.")
+            return True, messages, force_agent_id, gw_server
+        for name, row in stats.items():
+            active_bar = "*" * row["active"] + "." * max(0, row["max_concurrency"] - row["active"])
+            print_info(
+                f"  {name:12s} active=[{active_bar}] "
+                f"queued={row['queue_depth']} max={row['max_concurrency']} "
+                f"generation={row['generation']}"
+            )
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/lane-queue":
+        if command_queue is None:
+            print_warn("Command queue not available")
+            return True, messages, force_agent_id, gw_server
+        stats = command_queue.stats()
+        busy = {name: row for name, row in stats.items() if row["active"] or row["queue_depth"]}
+        if not busy:
+            print_info("  All lanes are idle.")
+            return True, messages, force_agent_id, gw_server
+        for name, row in busy.items():
+            print_info(f"  {name}: active={row['active']} queued={row['queue_depth']}")
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/concurrency":
+        if command_queue is None:
+            print_warn("Command queue not available")
+            return True, messages, force_agent_id, gw_server
+        parts2 = arg.strip().split()
+        if len(parts2) != 2:
+            print_warn("Usage: /concurrency <lane> <N>")
+            return True, messages, force_agent_id, gw_server
+        try:
+            new_max = max(1, int(parts2[1]))
+        except ValueError:
+            print_warn("N must be an integer")
+            return True, messages, force_agent_id, gw_server
+        command_queue.set_max_concurrency(parts2[0], new_max)
+        print_info(f"  {parts2[0]} max_concurrency -> {new_max}")
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/generation":
+        if command_queue is None:
+            print_warn("Command queue not available")
+            return True, messages, force_agent_id, gw_server
+        for name, row in command_queue.stats().items():
+            print_info(f"  {name}: generation={row['generation']}")
+        return True, messages, force_agent_id, gw_server
+
+    elif cmd == "/reset-lanes":
+        if command_queue is None:
+            print_warn("Command queue not available")
+            return True, messages, force_agent_id, gw_server
+        generations = command_queue.reset_all()
+        if not generations:
+            print_info("  No lanes to reset.")
+        else:
+            for name, generation in generations.items():
+                print_info(f"  {name}: generation -> {generation}")
         return True, messages, force_agent_id, gw_server
 
     elif cmd == "/accounts":
@@ -4032,7 +4258,12 @@ def handle_repl_command(
                 if agent_mgr is None or bindings is None:
                     print_warn("AgentManager or Bindings not available")
                     return True, messages, force_agent_id, gw_server
-                new_gw = GatewayServer(agent_mgr, bindings)
+                new_gw = GatewayServer(
+                    agent_mgr,
+                    bindings,
+                    llm_client=llm_client,
+                    command_queue=command_queue,
+                )
                 asyncio.run_coroutine_threadsafe(new_gw.start(), get_event_loop()).result()
                 set_gw_server(new_gw)
                 gw_server = new_gw
@@ -4098,7 +4329,11 @@ def handle_repl_command(
         print_info("    /inbox             Show heartbeat/cron/delivery background output")
         print_info("    /inbox clear       Clear background inbox")
         print_info("    /resilience        Show LLM retry/circuit state")
-        print_info("    /lanes             Show lane lock status")
+        print_info("    /lanes             Show named lane status")
+        print_info("    /lane-queue        Show active/queued lane work")
+        print_info("    /concurrency <lane> <N> Set lane concurrency")
+        print_info("    /generation        Show lane generation counters")
+        print_info("    /reset-lanes       Increment all lane generations")
         print_info("")
         print_info("  Gateway Commands:")
         print_info("    /bindings          List all route bindings")
@@ -4328,7 +4563,11 @@ def agent_loop() -> None:
     delivery_runner.start()
 
     guard = ContextGuard()
-    lane_lock = threading.Lock()
+    command_queue = CommandQueue()
+    command_queue.get_or_create_lane(LANE_MAIN, max_concurrency=1)
+    command_queue.get_or_create_lane(LANE_HEARTBEAT, max_concurrency=1)
+    command_queue.get_or_create_lane(LANE_CRON, max_concurrency=1)
+    command_queue.get_or_create_lane(LANE_DELIVERY, max_concurrency=1)
 
     conversations: dict[str, list[dict]] = {}
 
@@ -4356,7 +4595,7 @@ def agent_loop() -> None:
     gw_server: GatewayServer | None = None
     heartbeat = HeartbeatRunner(
         workspace=WORKSPACE_DIR,
-        lane_lock=lane_lock,
+        command_queue=command_queue,
         agent_mgr=agent_mgr,
         llm_client=llm_client,
         interval=float(os.getenv("HEARTBEAT_INTERVAL", "1800")),
@@ -4369,7 +4608,7 @@ def agent_loop() -> None:
     heartbeat.start()
     cron_svc = CronService(
         WORKSPACE_DIR / "CRON.json",
-        lane_lock=lane_lock,
+        command_queue=command_queue,
         agent_mgr=agent_mgr,
         llm_client=llm_client,
         default_agent_id=DEFAULT_AGENT_ID,
@@ -4469,7 +4708,7 @@ def agent_loop() -> None:
                         delivery_queue=delivery_queue,
                         delivery_runner=delivery_runner,
                         inbox=inbox,
-                        lane_lock=lane_lock,
+                        command_queue=command_queue,
                         active_session_key=cli_sk,
                         bootstrap_data=BOOTSTRAP_DATA,
                         skills_mgr=SKILLS_MANAGER,
@@ -4491,15 +4730,12 @@ def agent_loop() -> None:
                     if a:
                         sk = build_session_key(aid, channel=msg.channel, account_id=msg.account_id,
                                                peer_id=msg.peer_id, dm_scope=a.dm_scope)
-                        lane_lock.acquire()
-                        try:
-                            result = run_async(run_agent(
+                        future = command_queue.enqueue(LANE_MAIN, lambda: run_async(run_agent(
                                 agent_mgr, aid, sk, msg.text,
                                 channel=msg.channel,
                                 llm_client=llm_client,
-                            ))
-                        finally:
-                            lane_lock.release()
+                            )))
+                        result = future.result()
                         enqueue_delivery(delivery_queue, "default", msg.peer_id, result)
                         delivery_runner.process_pending()
                     else:
@@ -4512,9 +4748,7 @@ def agent_loop() -> None:
                         channel=msg.channel,
                         memory_context=memory_context,
                     )
-                    lane_lock.acquire()
-                    try:
-                        run_agent_turn(
+                    future = command_queue.enqueue(LANE_MAIN, lambda: run_agent_turn(
                             msg,
                             conversations,
                             mgr,
@@ -4524,9 +4758,8 @@ def agent_loop() -> None:
                             system_prompt=system_prompt,
                             session_key=cli_sk,
                             delivery_queue=delivery_queue,
-                        )
-                    finally:
-                        lane_lock.release()
+                        ))
+                    future.result()
                     delivery_runner.process_pending()
                 cli.allow_input()
             else:
@@ -4536,15 +4769,12 @@ def agent_loop() -> None:
                     if a:
                         sk = build_session_key(aid, channel=msg.channel, account_id=msg.account_id,
                                                peer_id=msg.peer_id, dm_scope=a.dm_scope)
-                        lane_lock.acquire()
-                        try:
-                            result = run_async(run_agent(
+                        future = command_queue.enqueue(LANE_MAIN, lambda: run_async(run_agent(
                                 agent_mgr, aid, sk, msg.text,
                                 channel=msg.channel,
                                 llm_client=llm_client,
-                            ))
-                        finally:
-                            lane_lock.release()
+                            )))
+                        result = future.result()
                         enqueue_delivery(delivery_queue, msg.channel, msg.peer_id, result)
                         delivery_runner.process_pending()
                     else:
@@ -4552,15 +4782,12 @@ def agent_loop() -> None:
                 else:
                     aid, sk = resolve_route(bindings, agent_mgr, channel=msg.channel,
                                             account_id=msg.account_id, peer_id=msg.peer_id)
-                    lane_lock.acquire()
-                    try:
-                        result = run_async(run_agent(
+                    future = command_queue.enqueue(LANE_MAIN, lambda: run_async(run_agent(
                             agent_mgr, aid, sk, msg.text,
                             channel=msg.channel,
                             llm_client=llm_client,
-                        ))
-                    finally:
-                        lane_lock.release()
+                        )))
+                    result = future.result()
                     enqueue_delivery(delivery_queue, msg.channel, msg.peer_id, result)
                     delivery_runner.process_pending()
 

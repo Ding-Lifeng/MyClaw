@@ -1,5 +1,9 @@
-# MyClaw
+# DClaw
 Based on the implementations of Claw0, NanoBot, and OpenClaw, develop a lightweight Agent.
+
+
+
+Renamed from `MyClaw` to `DClaw` on April 25, 2026.
 
 
 

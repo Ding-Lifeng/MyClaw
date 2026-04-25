@@ -85,7 +85,7 @@ MAX_TOOL_OUTPUT = 50000
 # 上下文限制
 CONTEXT_SAFE_LIMIT = 180000
 
-# 工作目录 -- 固定为 MyClaw 目录, 避免从仓库根目录启动时把运行文件写到 claw0 同级
+# 工作目录
 WORKDIR = Path(__file__).resolve().parent
 WORKSPACE_DIR = WORKDIR / "workspace-main"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)

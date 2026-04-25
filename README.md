@@ -21,6 +21,8 @@ Soul/Skill/Memory ✔
 
 Heartbeat/Cron ✔
 
+Reliable Message Delivery ✔
+
 
 
 # Todo：

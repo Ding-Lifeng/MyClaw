@@ -5,6 +5,8 @@ Based on the implementations of claw0, learn-claude-code, NanoBot and OpenClaw, 
 
 Renamed from `MyClaw` to `DClaw` on April 25, 2026.
 
+Reorganized project structure on April 27, 2026.
+
 
 
 # Current Status：
@@ -35,12 +37,20 @@ Concurrency ✔
 
 # Todo：
 
-Reorganize structure
+Test on wechat and feishu
+
+Refine Tool Use
+
+Configurable working directory
+
+Default Agent initial config
+
+Implement convenient and unified Agent, Channel, and API configuration
+
+Implement pip install -e . to register CLI command
 
 Refine Workspace and SandBox
 
 Refine Skills Management
 
 Refine Memory Search and Memory Management
-
-Test on wechat and feishu

@@ -8,4 +8,4 @@ anthropic
 ddgs
 readability-lxml
 chardet<6
-
+qrcode

@@ -5,7 +5,7 @@ from .channels import (
     ChannelAccount,
     ChannelManager,
     FeishuChannel,
-    WechatChannel,
+    WeixinPersonalChannel,
 )
 from .config import AppConfig
 
@@ -28,12 +28,18 @@ def register_configured_channels(config: AppConfig, mgr: ChannelManager) -> None
         mgr.accounts.append(fs_acc)
         mgr.register(FeishuChannel(fs_acc))
 
-    wx_webhook = config.channels.wechat_webhook_url
-    if wx_webhook and HAS_HTTPX:
-        wx_acc = ChannelAccount(
-            channel="wechat",
-            account_id="wechat-primary",
-            config={"webhook_url": wx_webhook},
+    if config.channels.weixin_enabled and HAS_HTTPX:
+        wx_personal_acc = ChannelAccount(
+            channel="weixin",
+            account_id="weixin-primary",
+            config={
+                "allow_from": config.channels.weixin_allow_from,
+                "base_url": config.channels.weixin_base_url,
+                "route_tag": config.channels.weixin_route_tag,
+                "token": config.channels.weixin_token,
+                "state_dir": config.channels.weixin_state_dir,
+                "poll_timeout": config.channels.weixin_poll_timeout,
+            },
         )
-        mgr.accounts.append(wx_acc)
-        mgr.register(WechatChannel(wx_acc))
+        mgr.accounts.append(wx_personal_acc)
+        mgr.register(WeixinPersonalChannel(wx_personal_acc))

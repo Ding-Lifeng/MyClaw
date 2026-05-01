@@ -83,13 +83,25 @@ from dclaw.workspace import WorkspacePolicy
 
 WORKSPACE_POLICY = WorkspacePolicy(project_root=WORKDIR, workspace_root=WORKSPACE_DIR)
 
-def enqueue_delivery(delivery_queue: DeliveryQueue | None, channel: str, to: str, text: str) -> bool:
+def enqueue_delivery(
+        delivery_queue: DeliveryQueue | None,
+        channel: str,
+        to: str,
+        text: str,
+        notify: bool = True,
+) -> bool:
     if delivery_queue is None:
         return False
     ids = delivery_queue.enqueue(channel, to, text)
-    if ids:
+    if ids and notify:
         print_delivery(f"queued {len(ids)} chunk(s) for {normalize_delivery_channel(channel)}:{to}")
     return bool(ids)
+
+def preview_text(text: str, limit: int = 120) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit - 3] + "..."
 
 def safe_path(raw: str) -> Path:
     return WORKSPACE_POLICY.resolve_workspace_path(raw)
@@ -114,6 +126,7 @@ from dclaw.tools import (
     TOOL_HANDLERS,
     configure_tools,
     get_tool_policy,
+    tool_log_sink,
 )
 
 # ---------------------------------------------------------------------------
@@ -247,8 +260,8 @@ def agent_loop() -> None:
     for channel_name in set(mgr.list_channels()) - before_channels:
         if channel_name == "feishu":
             print_channel("[+] Feishu channel registered (requires webhook server)")
-        elif channel_name == "wechat":
-            print_channel("[+] Wechat channel registered (webhook delivery)")
+        elif channel_name == "weixin":
+            print_channel("[+] Weixin personal channel registered (QR login + long-poll)")
 
     guard = ContextGuard()
     command_queue = CommandQueue()
@@ -370,6 +383,48 @@ def agent_loop() -> None:
                 continue
             msg_queue.put(msg)
 
+    def channel_reader(channel_name: str):
+        channel = mgr.get(channel_name)
+        while not stop_event.is_set() and channel is not None:
+            try:
+                msg = channel.receive()
+            except Exception as exc:
+                print_warn(f"[{channel_name}] receive error: {exc}")
+                stop_event.wait(5)
+                continue
+            if msg is None:
+                stop_event.wait(0.2)
+                continue
+            msg_queue.put(msg)
+
+    def add_background_inbound(msg: InboundMessage) -> None:
+        inbox.add(msg.channel, f"[{msg.channel} <- {msg.peer_id}] {preview_text(msg.text)}")
+
+    def add_background_outbound(channel: str, peer_id: str, text: str) -> None:
+        inbox.add(channel, f"[{channel} -> {peer_id}] {preview_text(text)}")
+
+    def add_background_tool(name: str, detail: str) -> None:
+        inbox.add("tool", f"[tool: {name}] {detail}")
+
+    def background_services(source: str) -> EngineServices:
+        return EngineServices(
+            auto_recall=auto_recall,
+            compose_runtime_system_prompt=compose_runtime_system_prompt,
+            print_info=lambda text: inbox.add(source, text),
+            print_assistant=lambda text: inbox.add(source, text),
+            enqueue_delivery=lambda delivery_queue, channel, to, text: enqueue_delivery(
+                delivery_queue, channel, to, text, notify=False
+            ),
+        )
+
+    def enqueue_background_delivery(channel: str, peer_id: str, text: str) -> None:
+        ids = delivery_queue.enqueue(channel, peer_id, text)
+        if ids:
+            inbox.add(
+                "delivery",
+                f"[delivery] queued {len(ids)} chunk(s) for {normalize_delivery_channel(channel)}:{peer_id}",
+            )
+
     def collect_background_outputs() -> None:
         for item in heartbeat.drain_output():
             inbox.add("heartbeat", item)
@@ -421,6 +476,19 @@ def agent_loop() -> None:
 
     cli_thread = threading.Thread(target=cli_reader, daemon=True)
     cli_thread.start()
+    channel_threads: list[threading.Thread] = []
+    for channel_name in mgr.list_channels():
+        channel = mgr.get(channel_name)
+        if channel_name == "cli" or not getattr(channel, "background_receive", False):
+            continue
+        thread = threading.Thread(
+            target=channel_reader,
+            args=(channel_name,),
+            daemon=True,
+            name=f"{channel_name}-reader",
+        )
+        thread.start()
+        channel_threads.append(thread)
     cron_thread = threading.Thread(target=cron_loop, daemon=True, name="cron-tick")
     cron_thread.start()
 
@@ -516,32 +584,53 @@ def agent_loop() -> None:
                     delivery_runner.flush()
                 cli.allow_input()
             else:
+                add_background_inbound(msg)
+                bg_services = background_services(msg.channel)
                 if force_agent_id:
                     aid = force_agent_id
                     a = agent_mgr.get_agent(aid)
                     if a:
                         sk = build_session_key(aid, channel=msg.channel, account_id=msg.account_id,
                                                peer_id=msg.peer_id, dm_scope=a.dm_scope)
-                        future = command_queue.enqueue(LANE_MAIN, lambda: run_async(run_agent_with_services(
+                        def run_background_forced():
+                            with tool_log_sink(add_background_tool):
+                                return run_async(run_agent(
+                                    agent_mgr, aid, sk, msg.text,
+                                    channel=msg.channel,
+                                    llm_client=llm_client,
+                                    services=bg_services,
+                                ))
+
+                        future = command_queue.enqueue(LANE_MAIN, run_background_forced)
+                        result = future.result()
+                        add_background_outbound(msg.channel, msg.peer_id, result)
+                        enqueue_background_delivery(msg.channel, msg.peer_id, result)
+                        delivery_runner.flush()
+                    else:
+                        inbox.add(msg.channel, f"Agent '{aid}' not found")
+                else:
+                    aid, sk = resolve_route(
+                        bindings,
+                        agent_mgr,
+                        channel=msg.channel,
+                        account_id=msg.account_id,
+                        peer_id=msg.peer_id,
+                        services=bg_services,
+                    )
+
+                    def run_background_default():
+                        with tool_log_sink(add_background_tool):
+                            return run_async(run_agent(
                                 agent_mgr, aid, sk, msg.text,
                                 channel=msg.channel,
                                 llm_client=llm_client,
-                            )))
-                        result = future.result()
-                        enqueue_delivery(delivery_queue, msg.channel, msg.peer_id, result)
-                        delivery_runner.flush()
-                    else:
-                        print_warn(f"Agent '{aid}' not found")
-                else:
-                    aid, sk = resolve_route_with_services(bindings, agent_mgr, channel=msg.channel,
-                                                          account_id=msg.account_id, peer_id=msg.peer_id)
-                    future = command_queue.enqueue(LANE_MAIN, lambda: run_async(run_agent_with_services(
-                            agent_mgr, aid, sk, msg.text,
-                            channel=msg.channel,
-                            llm_client=llm_client,
-                        )))
+                                services=bg_services,
+                            ))
+
+                    future = command_queue.enqueue(LANE_MAIN, run_background_default)
                     result = future.result()
-                    enqueue_delivery(delivery_queue, msg.channel, msg.peer_id, result)
+                    add_background_outbound(msg.channel, msg.peer_id, result)
+                    enqueue_background_delivery(msg.channel, msg.peer_id, result)
                     delivery_runner.flush()
 
     except KeyboardInterrupt:
@@ -550,6 +639,8 @@ def agent_loop() -> None:
         stop_event.set()
         cron_stop.set()
         cli_thread.join(timeout=2.0)
+        for thread in channel_threads:
+            thread.join(timeout=2.0)
         cron_thread.join(timeout=2.0)
         heartbeat.stop()
         delivery_runner.stop()

@@ -15,7 +15,7 @@ from .lanes import CommandQueue, LANE_DELIVERY
 
 DELIVERY_BACKOFF_MS = [5_000, 25_000, 120_000, 600_000]
 DELIVERY_MAX_RETRIES = 5
-DELIVERY_CHANNEL_LIMITS = {"default": 4096, "feishu": 4096, "wechat": 2048}
+DELIVERY_CHANNEL_LIMITS = {"default": 4096, "feishu": 4096, "weixin": 4000}
 
 
 @dataclass
@@ -59,8 +59,8 @@ def normalize_delivery_channel(channel: str) -> str:
     value = (channel or "default").strip().lower()
     if value in ("cli", "console", "local", "websocket"):
         return "default"
-    if value in ("wechat", "weixin", "wx"):
-        return "wechat"
+    if value in ("weixin", "wechat", "wx", "personal-wechat"):
+        return "weixin"
     if value == "feishu":
         return "feishu"
     return "default"
@@ -340,4 +340,3 @@ def enqueue_delivery(delivery_queue: DeliveryQueue | None, channel: str, to: str
     if delivery_queue is None:
         return False
     return bool(delivery_queue.enqueue(channel, to, text))
-

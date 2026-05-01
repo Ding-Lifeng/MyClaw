@@ -12,6 +12,8 @@ import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -199,6 +201,15 @@ def _default_print_tool(name: str, detail: str) -> None:
     print(f"[tool: {name}] {detail}")
 
 _print_tool = _default_print_tool
+_tool_log_sink: ContextVar[Callable[[str, str], None] | None] = ContextVar("tool_log_sink", default=None)
+
+@contextmanager
+def tool_log_sink(sink: Callable[[str, str], None] | None):
+    token = _tool_log_sink.set(sink)
+    try:
+        yield
+    finally:
+        _tool_log_sink.reset(token)
 
 def configure_tools(
         print_tool_func=None,
@@ -247,6 +258,10 @@ def set_tool_mode(mode: ToolMode | str) -> ToolMode:
     return parsed
 
 def print_tool(name: str, detail: str) -> None:
+    sink = _tool_log_sink.get()
+    if sink is not None:
+        sink(name, detail)
+        return
     _print_tool(name, detail)
 
 def safe_path(raw: str) -> Path:

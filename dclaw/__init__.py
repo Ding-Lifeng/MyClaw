@@ -9,7 +9,7 @@ from .channels import (
     DefaultChannel,
     FeishuChannel,
     InboundMessage,
-    WechatChannel,
+    WeixinPersonalChannel,
 )
 from .context import ContextGuard
 from .delivery import DeliveryQueue, DeliveryRunner, QueuedDelivery
@@ -93,7 +93,7 @@ __all__ = [
     "ToolMode",
     "ToolPermissions",
     "ToolPolicy",
-    "WechatChannel",
+    "WeixinPersonalChannel",
     "WorkspacePolicy",
     "build_session_key",
     "build_system_prompt",

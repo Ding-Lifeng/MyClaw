@@ -7,6 +7,8 @@ Renamed from `MyClaw` to `DClaw` on April 25, 2026.
 
 Reorganized project structure on April 27, 2026.
 
+Tested WeChat integration for DClaw on May 1, 2026.
+
 
 
 # Current Status：
@@ -37,8 +39,6 @@ Concurrency ✔
 
 # Todo：
 
-Test on wechat and feishu
-
 Configurable working directory
 
 Default Agent initial config
@@ -47,6 +47,7 @@ Implement convenient and unified Agent, Channel, and API configuration
 
 Implement pip install -e . to register CLI command
 
+Test on feishu
 Refine Workspace and SandBox
 
 Refine Skills Management

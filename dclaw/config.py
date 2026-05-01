@@ -30,7 +30,13 @@ class ChannelSettings:
     feishu_encrypt_key: str
     feishu_bot_open_id: str
     feishu_is_lark: bool
-    wechat_webhook_url: str
+    weixin_enabled: bool
+    weixin_allow_from: list[str]
+    weixin_base_url: str
+    weixin_route_tag: str
+    weixin_token: str
+    weixin_state_dir: str
+    weixin_poll_timeout: int
 
 
 @dataclass(frozen=True)
@@ -115,7 +121,17 @@ def load_config(env_path: Path = ENV_PATH, override: bool = True) -> AppConfig:
             feishu_encrypt_key=_env_str("FEISHU_ENCRYPT_KEY"),
             feishu_bot_open_id=_env_str("FEISHU_BOT_OPEN_ID"),
             feishu_is_lark=_env_bool("FEISHU_IS_LARK"),
-            wechat_webhook_url=_env_str("WECHAT_WEBHOOK_URL"),
+            weixin_enabled=_env_bool("WEIXIN_ENABLED"),
+            weixin_allow_from=[
+                item.strip()
+                for item in _env_str("WEIXIN_ALLOW_FROM", "*").split(",")
+                if item.strip()
+            ],
+            weixin_base_url=_env_str("WEIXIN_BASE_URL", "https://ilinkai.weixin.qq.com"),
+            weixin_route_tag=_env_str("WEIXIN_ROUTE_TAG"),
+            weixin_token=_env_str("WEIXIN_TOKEN"),
+            weixin_state_dir=_env_str("WEIXIN_STATE_DIR"),
+            weixin_poll_timeout=_env_int("WEIXIN_POLL_TIMEOUT", 35),
         ),
         runtime=RuntimeSettings(
             heartbeat_interval=_env_float("HEARTBEAT_INTERVAL", 1800.0),

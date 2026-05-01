@@ -39,8 +39,6 @@ Concurrency ✔
 
 Test on wechat and feishu
 
-Refine Tool Use
-
 Configurable working directory
 
 Default Agent initial config
@@ -54,3 +52,5 @@ Refine Workspace and SandBox
 Refine Skills Management
 
 Refine Memory Search and Memory Management
+
+Refine README

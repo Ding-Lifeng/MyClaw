@@ -619,8 +619,9 @@ def build_system_prompt(
         "- Read a known file path: use read_file.\n"
         "- Modify files: use edit_file for targeted replacements and write_file for complete file writes.\n"
         "- Run tests, git, package managers, or project commands: use bash.\n"
-        "- Search current or external web information: use web_search and include source URLs in the answer.\n"
-        "- Fetch a specific web page from a search result or user-provided URL: use web_fetch.\n"
+        "- Search current or external web information: use web_search to discover candidate source URLs.\n"
+        "- Treat web_search snippets as orientation, not full evidence. For facts, current data, recommendations, comparisons, instructions, implementation details, prices, schedules, or any claim that needs support beyond the snippet, call web_fetch on the most relevant URL before answering.\n"
+        "- Fetch a specific web page from a search result or user-provided URL: use web_fetch, then base the answer on the fetched text and cite source URLs.\n"
         "- Do not use bash for ordinary directory listing, file discovery, file reading, or text search."
     )
 

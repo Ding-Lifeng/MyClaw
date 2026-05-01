@@ -44,6 +44,12 @@ class RuntimeSettings:
 
 
 @dataclass(frozen=True)
+class WebSettings:
+    fetch_use_jina_reader: bool
+    jina_api_key: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     project_root: Path
     workspace_dir: Path
@@ -54,6 +60,7 @@ class AppConfig:
     llm: LLMSettings
     channels: ChannelSettings
     runtime: RuntimeSettings
+    web: WebSettings
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -117,6 +124,10 @@ def load_config(env_path: Path = ENV_PATH, override: bool = True) -> AppConfig:
             resilience_max_retries=_env_int("RESILIENCE_MAX_RETRIES", 3),
             resilience_circuit_threshold=_env_int("RESILIENCE_CIRCUIT_THRESHOLD", 5),
             resilience_circuit_cooldown=_env_float("RESILIENCE_CIRCUIT_COOLDOWN", 300.0),
+        ),
+        web=WebSettings(
+            fetch_use_jina_reader=_env_bool("WEB_FETCH_USE_JINA_READER", False),
+            jina_api_key=_env_str("JINA_API_KEY"),
         ),
     )
 

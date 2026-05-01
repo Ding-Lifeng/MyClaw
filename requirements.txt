@@ -5,3 +5,7 @@ websockets
 croniter
 openai
 anthropic
+ddgs
+readability-lxml
+chardet<6
+

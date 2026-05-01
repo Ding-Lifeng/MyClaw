@@ -9,7 +9,7 @@ from .channels import ChannelManager, InboundMessage
 from .config import MODEL_ID
 from .context import ContextGuard
 from .delivery import DeliveryQueue
-from .llm import AnthropicClient, LLMClient, create_llm_client
+from .llm import AnthropicClient, LLMClient, ResilientLLMClient, create_llm_client
 from .runtime import AgentManager, BindingTable, DEFAULT_AGENT_ID, SessionStore, build_session_key
 from .tools import TOOLS, process_tool_call
 
@@ -104,6 +104,84 @@ def _process_tool_call_guarded(
         )
     return process_tool_call(tool_name, tool_args)
 
+def _unwrap_client(client: LLMClient) -> LLMClient:
+    current = client
+    seen: set[int] = set()
+    while isinstance(current, ResilientLLMClient) and id(current) not in seen:
+        seen.add(id(current))
+        current = current.inner
+    return current
+
+def _uses_anthropic_messages(client: LLMClient) -> bool:
+    return isinstance(_unwrap_client(client), AnthropicClient)
+
+def _tool_args(tc: dict[str, Any]) -> dict[str, Any]:
+    raw = tc.get("function", {}).get("arguments", "{}")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+def _build_assistant_message(
+        client: LLMClient,
+        assistant_text: str,
+        tool_calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
+    if not tool_calls:
+        return assistant_msg
+    if _uses_anthropic_messages(client):
+        content_blocks = []
+        if assistant_text:
+            content_blocks.append({"type": "text", "text": assistant_text})
+        for tc in tool_calls:
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id", ""),
+                "name": tc["function"]["name"],
+                "input": _tool_args(tc),
+            })
+        assistant_msg["content"] = content_blocks
+    else:
+        assistant_msg["tool_calls"] = tool_calls
+    return assistant_msg
+
+def _append_tool_results(
+        client: LLMClient,
+        messages: list[dict[str, Any]],
+        tool_calls: list[dict[str, Any]],
+        tool_call_counts: dict[str, int],
+) -> dict[str, Any] | list[dict[str, Any]]:
+    if _uses_anthropic_messages(client):
+        tool_results = []
+        for tc in tool_calls:
+            tool_name = tc["function"]["name"]
+            tool_args = _tool_args(tc)
+            tool_call_id = tc.get("id")
+            result = _process_tool_call_guarded(tool_name, tool_args, tool_call_counts)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_call_id,
+                "content": result,
+            })
+        tool_msg = {"role": "user", "content": tool_results}
+        messages.append(tool_msg)
+        return tool_msg
+
+    tool_messages = []
+    for tc in tool_calls:
+        tool_name = tc["function"]["name"]
+        tool_args = _tool_args(tc)
+        tool_call_id = tc.get("id")
+        result = _process_tool_call_guarded(tool_name, tool_args, tool_call_counts)
+        tool_msg = {"role": "tool", "content": result, "tool_call_id": tool_call_id}
+        messages.append(tool_msg)
+        tool_messages.append(tool_msg)
+    return tool_messages
+
 def resolve_route(bindings: BindingTable, mgr: AgentManager,
                   channel: str, peer_id: str,
                   account_id: str = "", guild_id: str = "",
@@ -185,49 +263,15 @@ async def _agent_loop(client: LLMClient, model: str, system: str, messages: list
         assistant_text = response["text"]
         tool_calls = response["tool_calls"]
 
-        assistant_msg = {"role": "assistant", "content": assistant_text}
-        if tool_calls:
-            if isinstance(client, AnthropicClient):
-                content_blocks = []
-                if assistant_text:
-                    content_blocks.append({"type": "text", "text": assistant_text})
-                for tc in tool_calls:
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "input": json.loads(tc["function"].get("arguments", "{}")),
-                    })
-                assistant_msg["content"] = content_blocks
-            else:
-                assistant_msg["tool_calls"] = tool_calls
+        assistant_msg = _build_assistant_message(client, assistant_text, tool_calls)
         messages.append(assistant_msg)
+
+        if tool_calls:
+            _append_tool_results(client, messages, tool_calls, tool_call_counts)
+            continue
 
         if finish_reason == "stop":
             return assistant_text or "[no text]"
-
-        if finish_reason == "tool_calls":
-            if isinstance(client, AnthropicClient):
-                tool_results = []
-                for tc in tool_calls:
-                    tool_name = tc["function"]["name"]
-                    tool_args = json.loads(tc["function"].get("arguments", "{}"))
-                    tool_call_id = tc.get("id")
-                    result = _process_tool_call_guarded(tool_name, tool_args, tool_call_counts)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id,
-                        "content": result,
-                    })
-                messages.append({"role": "user", "content": tool_results})
-            else:
-                for tc in tool_calls:
-                    tool_name = tc["function"]["name"]
-                    tool_args = json.loads(tc["function"].get("arguments", "{}"))
-                    tool_call_id = tc.get("id")
-                    result = _process_tool_call_guarded(tool_name, tool_args, tool_call_counts)
-                    messages.append({"role": "tool", "content": result, "tool_call_id": tool_call_id})
-            continue
 
         return assistant_text or f"[finish_reason={finish_reason}]"
     return "[max tool iterations reached]"
@@ -294,30 +338,21 @@ def run_agent_turn(
         assistant_content = response["text"]
         tool_calls = response["tool_calls"]
 
-        assistant_msg = {
-            "role": "assistant",
-            "content": assistant_content
-        }
-
-        if tool_calls:
-            if isinstance(client, AnthropicClient):
-                content_blocks = []
-                if assistant_content:
-                    content_blocks.append({"type": "text", "text": assistant_content})
-                for tc in tool_calls:
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "input": json.loads(tc["function"]["arguments"]),
-                    })
-                assistant_msg["content"] = content_blocks
-            else:
-                assistant_msg["tool_calls"] = tool_calls
+        assistant_msg = _build_assistant_message(client, assistant_content, tool_calls)
 
         messages.append(assistant_msg)
         if should_persisit:
             store.append_transcript(sk, assistant_msg.copy())
+
+        if tool_calls:
+            tool_messages = _append_tool_results(client, messages, tool_calls, tool_call_counts)
+            if should_persisit:
+                if isinstance(tool_messages, list):
+                    for tool_msg in tool_messages:
+                        store.append_transcript(sk, tool_msg.copy())
+                else:
+                    store.append_transcript(sk, tool_messages.copy())
+            continue
 
         # --- 调用终止条件stop_reason ---
         if finish_reason == "stop":
@@ -329,46 +364,6 @@ def run_agent_turn(
                     else:
                         svc.print_assistant(assistant_content)
             break
-
-        elif finish_reason == "tool_calls":
-            if isinstance(client, AnthropicClient):
-                tool_results = []
-                for tc in tool_calls:
-                    tool_name = tc["function"]["name"]
-                    tool_args = json.loads(tc["function"]["arguments"])
-                    tool_call_id = tc["id"]
-
-                    result = _process_tool_call_guarded(tool_name, tool_args, tool_call_counts)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id,
-                        "content": result
-                    })
-
-                tool_msg = {
-                    "role": "user",
-                    "content": tool_results
-                }
-                messages.append(tool_msg)
-                if should_persisit:
-                    store.append_transcript(sk, tool_msg.copy())
-            else:
-                for tc in tool_calls:
-                    tool_name = tc["function"]["name"]
-                    tool_args = json.loads(tc["function"]["arguments"])
-                    tool_call_id = tc["id"]
-
-                    result = _process_tool_call_guarded(tool_name, tool_args, tool_call_counts)
-                    tool_msg = {
-                        "role": "tool",
-                        "content": result,
-                        "tool_call_id": tool_call_id
-                    }
-                    messages.append(tool_msg)
-
-                    if should_persisit:
-                        store.append_transcript(sk, tool_msg.copy())
-            continue
 
         else:
             svc.print_info(f"[finish_reason]={finish_reason}")

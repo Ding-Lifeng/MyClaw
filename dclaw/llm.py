@@ -20,6 +20,15 @@ dashscope.base_http_api_url = CONFIG.llm.dashscope_base_url
 STATE_DIR = CONFIG.state_dir
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+def _tool_function_field(tool_call: Any, name: str, default: Any = None) -> Any:
+    function = _field(tool_call, "function", {})
+    return _field(function, name, default)
+
 class LLMClient(ABC):
     @abstractmethod
     def chat(
@@ -364,19 +373,18 @@ class OpenAIClient(LLMClient):
 
         msg = resp.choices[0].message
         tool_calls = []
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                tool_calls.append({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    }
-                })
+        for tc in getattr(msg, "tool_calls", None) or []:
+            tool_calls.append({
+                "id": _field(tc, "id", ""),
+                "type": "function",
+                "function": {
+                    "name": _tool_function_field(tc, "name", ""),
+                    "arguments": _tool_function_field(tc, "arguments", "{}")
+                }
+            })
 
         return {
-            "text": msg.content or "",
+            "text": _field(msg, "content", "") or "",
             "tool_calls": tool_calls,
             "finish_reason": resp.choices[0].finish_reason,
             "raw": resp
@@ -407,23 +415,23 @@ class DashScopeClient(LLMClient):
         finish_reason = choice.finish_reason
 
         text = ""
-        if hasattr(msg, "content"):
-            if isinstance(msg.content, list):
-                text = "\n".join(x.get("text", "") for x in msg.content if isinstance(x, dict))
+        content = _field(msg, "content")
+        if content is not None:
+            if isinstance(content, list):
+                text = "\n".join(_field(x, "text", "") for x in content)
             else:
-                text = str(msg.content)
+                text = str(content)
 
         tool_calls = []
-        if finish_reason == "tool_calls" and hasattr(msg, "tool_calls"):
-            for tc in msg.tool_calls:
-                tool_calls.append({
-                    "id": tc.get("id", ""),
-                    "type": "function",
-                    "function": {
-                        "name": tc["function"]["name"],
-                        "arguments": tc["function"].get("arguments", "{}")
-                    }
-                })
+        for tc in _field(msg, "tool_calls", []) or []:
+            tool_calls.append({
+                "id": _field(tc, "id", ""),
+                "type": "function",
+                "function": {
+                    "name": _tool_function_field(tc, "name", ""),
+                    "arguments": _tool_function_field(tc, "arguments", "{}")
+                }
+            })
 
         return {
             "text": text,
